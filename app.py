@@ -1708,7 +1708,7 @@ with tab2:
         with col2:
             new_date = st.date_input("Date", key="new_hol_date")
 
-        if st.button("➕ Add holiday", key="btn_add_holiday", use_container_width=True, type="primary"):
+        if st.button("➕ Add holiday", key="btn_add_holiday", use_container_width=True, type="secondary"):
             if not new_holiday.strip():
                 st.error("Please enter a holiday name.")
             else:
