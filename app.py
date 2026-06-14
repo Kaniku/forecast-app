@@ -40,7 +40,6 @@ def _init_session_state() -> None:
         "ecommerce_holidays": pd.DataFrame(columns=["holiday", "ds"]),
         "selected_models": list(MODEL_OPTIONS),
         "selected_metric": "MAPE",
-        "metric_rules": {"MAPE": {"min": 0.0, "max": 0.15}},
         "auto_select_all_models": True,
         "forecast_start_date": None,
         "forecast_end_date": None,
@@ -49,22 +48,12 @@ def _init_session_state() -> None:
         "results_placeholder": None,
         "bq_credentials": None,
         "bq_authenticated": False,
+        "campaign_manual_list": [],
+        "holiday_manual_list": [],
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
-
-    for m in METRIC_OPTIONS:
-        current_rule = st.session_state["metric_rules"].get(
-            m,
-            {"min": 0.0, "max": 0.15 if m == "MAPE" else 100.0},
-        )
-        if f"min_thr_{m}" not in st.session_state:
-            st.session_state[f"min_thr_{m}"] = current_rule["min"]
-        if f"max_thr_{m}" not in st.session_state:
-            st.session_state[f"max_thr_{m}"] = current_rule["max"]
-        if f"slider_{m}" not in st.session_state:
-            st.session_state[f"slider_{m}"] = (current_rule["min"], current_rule["max"])
 
 
 def _load_uploaded_file(uploaded: Any) -> pd.DataFrame:
@@ -73,7 +62,7 @@ def _load_uploaded_file(uploaded: Any) -> pd.DataFrame:
     if not raw:
         raise ValueError("The file is empty.")
     if name.endswith(".csv"):
-        return pd.read_csv(io.BytesIO(raw))
+        return pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return pd.read_excel(io.BytesIO(raw))
     raise ValueError("Unsupported format. Please upload a .csv or .xlsx file.")
@@ -304,22 +293,6 @@ def _ets_forecast_intervals(
         return forecast_array * 0.9, forecast_array * 1.1
 
     raise ValueError(f"Unsupported metric: {metric_name}")
-
-
-def _check_metric_rules(metric_results: dict[str, float], metric_rules: dict[str, dict[str, Any]]) -> bool:
-    """Check if all metric results satisfy the defined rules."""
-    for m, result in metric_results.items():
-        if m not in metric_rules:
-            continue
-        
-        rule = metric_rules[m]
-        min_thr = rule.get("min", -np.inf)
-        max_thr = rule.get("max", np.inf)
-        
-        if not (min_thr <= result <= max_thr):
-            return False
-            
-    return True
 
 
 def _fit_predict_prophet_validation(
@@ -1280,116 +1253,28 @@ holiday adjustments.
 
 # --------------------------------------------------------------------------- 1
 st.header("1. Data source")
-st.markdown("Upload a spreadsheet **or** run a BigQuery SQL query. Your data will load into a data table for review.")
-
-col_src_a, col_src_b = st.columns(2)
-with col_src_a:
-    source_mode = st.radio(
-        "Source type",
-        ["Upload CSV / XLSX", "BigQuery SQL"],
-        horizontal=True,
-        key="source_mode",
-    )
+st.markdown("Upload a CSV or XLSX file. Your data will load into a data table for review.")
 
 st.session_state["load_error"] = None
 
-if source_mode == "Upload CSV / XLSX":
-    uploaded = st.file_uploader(
-        "Choose a file",
-        type=["csv", "xlsx", "xls"],
-        key="file_uploader",
-    )
-    if st.button("Load data from file", type="primary", key="btn_load_file"):
-        if uploaded is None:
-            st.session_state["load_error"] = "Choose a file first."
-        else:
-            try:
-                st.session_state["df_raw"] = _load_uploaded_file(uploaded)
-                st.session_state["df_mapped"] = None
-                st.session_state["schema_error"] = None
-                st.session_state["forecast_run_done"] = False
-                st.session_state["results_placeholder"] = None
-            except Exception as e:  # noqa: BLE001 â€” user-facing parse / IO errors
-                st.session_state["load_error"] = str(e)
-                st.session_state["df_raw"] = None
-else:
-    st.subheader("BigQuery Authentication")
-    if st.session_state.get("bq_authenticated") and st.session_state.get("bq_credentials") is not None:
-        st.success("âœ… Authenticated with Google Cloud.")
-        if st.button("Change Account", key="btn_change_account", help="Force re-authentication with a different account."):
-            with st.spinner("Preparing authentication..."):
-                try:
-                    import pydata_google_auth
-                    # NOOP cache forces a new login flow by ignoring the local cache
-                    creds = pydata_google_auth.get_user_credentials(
-                        ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/bigquery'],
-                        credentials_cache=pydata_google_auth.cache.NOOP
-                    )
-                    st.session_state["bq_credentials"] = creds
-                    st.session_state["bq_authenticated"] = True
-                    st.rerun()
-                except ImportError:
-                    st.error("Google sign-in is not available right now. Please ask your administrator to enable BigQuery authentication.")
-                except Exception as e:
-                    st.error(f"Could not sign in to Google Cloud. {_friendly_ui_error(str(e))}")
+uploaded = st.file_uploader(
+    "Choose a file",
+    type=["csv", "xlsx", "xls"],
+    key="file_uploader",
+)
+if st.button("Load data from file", type="primary", key="btn_load_file"):
+    if uploaded is None:
+        st.session_state["load_error"] = "Choose a file first."
     else:
-        st.info("You must authenticate to run BigQuery queries.")
-        if st.button("Authenticate with Google", key="btn_auth_gcp", type="primary"):
-            with st.spinner("Waiting for browser authentication..."):
-                try:
-                    import pydata_google_auth
-                    # Uses default cache behavior
-                    creds = pydata_google_auth.get_user_credentials(
-                        ['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/bigquery']
-                    )
-                    st.session_state["bq_credentials"] = creds
-                    st.session_state["bq_authenticated"] = True
-                    st.rerun()
-                except ImportError:
-                    st.error("Google sign-in is not available right now. Please ask your administrator to enable BigQuery authentication.")
-                except Exception as e:
-                    st.error(f"Could not sign in to Google Cloud. {_friendly_ui_error(str(e))}")
-    
-    st.divider()
-
-    bq_sql = st.text_area(
-        "SQL query", 
-        height=200, 
-        placeholder="SELECT order_date, sales FROM `project.dataset.table`", 
-        key="bq_sql",
-        help="Your query should return at least one date column and one numeric value column."
-    )
-    
-    bq_project = st.text_input(
-        "GCP project ID",
-        value="tbdproject-334912",
-        key="bq_project",
-        help="Defaults to tbdproject-334912; users can edit this before loading.",
-    )
-
-    if st.button("Check Query", type="secondary", help="Estimate bytes processed (Dry Run)"):
-        if not st.session_state.get("bq_authenticated"):
-            st.warning("Please authenticate first.")
-        elif not bq_sql.strip():
-            st.warning("Enter a query first.")
-        else:
-            with st.spinner("Checking..."):
-                result = _dry_run_bigquery(bq_sql, bq_project, credentials=st.session_state.get("bq_credentials"))
-                st.info(result)
-
-    if st.button("Load data from BigQuery", type="primary", key="btn_load_bq"):
-        if not st.session_state.get("bq_authenticated"):
-            st.warning("Please authenticate first.")
-        else:
-            try:
-                st.session_state["df_raw"] = _load_bigquery(bq_sql, bq_project or None, credentials=st.session_state.get("bq_credentials"))
-                st.session_state["df_mapped"] = None
-                st.session_state["schema_error"] = None
-                st.session_state["forecast_run_done"] = False
-                st.session_state["results_placeholder"] = None
-            except Exception as e:  # noqa: BLE001
-                st.session_state["load_error"] = str(e)
-                st.session_state["df_raw"] = None
+        try:
+            st.session_state["df_raw"] = _load_uploaded_file(uploaded)
+            st.session_state["df_mapped"] = None
+            st.session_state["schema_error"] = None
+            st.session_state["forecast_run_done"] = False
+            st.session_state["results_placeholder"] = None
+        except Exception as e:  # noqa: BLE001 — user-facing parse / IO errors
+            st.session_state["load_error"] = str(e)
+            st.session_state["df_raw"] = None
 
 if st.session_state["load_error"]:
     error_msg = st.session_state["load_error"]
@@ -1434,7 +1319,7 @@ else:
             key="pick_metrics",
         )
 
-    if st.button("Apply schema for forecasting", key="btn_schema"):
+    if st.button("Apply schema for forecasting", key="btn_schema", type="primary"):
         st.session_state["date_col"] = date_pick
         st.session_state["metric_cols"] = metric_pick
         st.session_state["metric_col"] = metric_pick[0] if metric_pick else None
@@ -1494,11 +1379,20 @@ st.divider()
 # --------------------------------------------------------------------------- 3
 st.header("3. Seasonality & holidays")
 st.markdown("Capture **campaign windows** and **e-commerce holidays** for Prophet regressors / holidays (stored for later use).")
+st.info(
+    "📌 Both campaigns and holidays are optional but "
+    "recommended. Campaigns help the model understand "
+    "sales spikes from promotions. Holidays help it "
+    "account for special dates that affect buying behavior. "
+    "You can fill in one, both, or neither."
+)
 
 tab1, tab2 = st.tabs(["\U0001F4C5 Campaign Periods", "\U0001F389 E-commerce Holidays"])
 
 with tab1:
     st.subheader("Campaign periods")
+    st.caption("Date ranges when you ran promotions or sales events — e.g. 11.11, Black Friday, Harbolnas.")
+
     if st.button("Refresh campaign periods from backend CSV", key="btn_refresh_campaigns"):
         try:
             st.session_state["campaign_periods"] = _load_campaign_periods_csv()
@@ -1517,39 +1411,153 @@ with tab1:
         st.error(_friendly_config_error(st.session_state["campaign_load_error"], kind="campaign"))
         st.info("Campaign options will appear here once the campaign file is available.")
     else:
-        st.dataframe(st.session_state["campaign_periods"], use_container_width=True)
-        label_options = st.session_state["campaign_periods"]["label"].dropna().unique().tolist()
-        st.session_state["selected_campaign_labels"] = st.multiselect(
-            "Campaigns to include",
-            options=label_options,
-            default=st.session_state.get("selected_campaign_labels") or label_options,
-            key="multiselect_campaigns",
-            help="These campaign options are managed centrally and are read-only here.",
-        )
+        # Load defaults
+        default_camps = st.session_state.get("campaign_periods", pd.DataFrame()).copy()
+        if default_camps.empty:
+            default_camps = pd.DataFrame(columns=["start", "end", "label"])
 
-        with st.expander("\u2795 Add campaign dates manually", expanded=False):
-            st.caption("Manually add campaign dates")
-            manual_campaigns = st.data_editor(
-                st.session_state["campaign_manual"],
-                column_config={
-                    "label": st.column_config.TextColumn("Campaign Label"),
-                    "start": st.column_config.DateColumn("Start Date"),
-                    "end": st.column_config.DateColumn("End Date"),
-                },
-                num_rows="dynamic",
-                use_container_width=True,
-                key="editor_manual_campaigns",
+        if "selected_campaign_labels" not in st.session_state or st.session_state["selected_campaign_labels"] is None:
+            st.session_state["selected_campaign_labels"] = default_camps["label"].dropna().unique().tolist()
+
+        manual_camps_list = st.session_state.get("campaign_manual_list", [])
+
+        all_campaign_rows: list[dict[str, Any]] = []
+        for _, row in default_camps.iterrows():
+            all_campaign_rows.append(
+                {
+                    "label": row["label"],
+                    "start": row["start"],
+                    "end": row["end"],
+                    "source": "default",
+                }
             )
-        manual_campaigns["label"] = manual_campaigns["label"].astype(str).str.strip()
-        manual_campaigns["start"] = pd.to_datetime(manual_campaigns["start"], errors="coerce").dt.normalize()
-        manual_campaigns["end"] = pd.to_datetime(manual_campaigns["end"], errors="coerce").dt.normalize()
-        manual_campaigns = manual_campaigns.dropna(subset=["label", "start", "end"])
-        manual_campaigns = manual_campaigns[manual_campaigns["label"] != ""]
-        manual_campaigns = manual_campaigns.drop_duplicates(subset=["label", "start", "end"]).reset_index(drop=True)
-        st.session_state["campaign_manual"] = manual_campaigns
+        for idx, m_row in enumerate(manual_camps_list):
+            all_campaign_rows.append(
+                {
+                    "label": m_row["label"],
+                    "start": m_row["start"],
+                    "end": m_row["end"],
+                    "source": "manual",
+                    "manual_index": idx,
+                }
+            )
+
+        for i in range(len(all_campaign_rows)):
+            if f"chk_camp_{i}" not in st.session_state:
+                st.session_state[f"chk_camp_{i}"] = True
+
+        all_selected = all(
+            st.session_state.get(f"chk_camp_{i}", True) for i in range(len(all_campaign_rows))
+        )
+        btn_label = "Deselect all" if all_selected else "Select all"
+        if st.button(btn_label, key="btn_select_all_campaigns"):
+            new_val = not all_selected
+            for i in range(len(all_campaign_rows)):
+                st.session_state[f"chk_camp_{i}"] = new_val
+            st.rerun()
+
+        st.write("")
+        col_inc, col_lbl, col_start, col_end, col_src, col_del = st.columns([0.5, 3, 2, 2, 1, 0.5])
+        col_inc.markdown("**✓**")
+        col_lbl.markdown("**Campaign Name**")
+        col_start.markdown("**Start Date**")
+        col_end.markdown("**End Date**")
+        col_src.markdown("**Source**")
+        col_del.markdown("")
+        st.markdown('<hr style="margin: 4px 0 8px 0;">', unsafe_allow_html=True)
+
+        new_manual_list = []
+
+        with st.container(height=300):
+            for i, row in enumerate(all_campaign_rows):
+                row_cols = st.columns([0.5, 3, 2, 2, 1, 0.5])
+                with row_cols[0]:
+                    checked = st.checkbox("", key=f"chk_camp_{i}", label_visibility="collapsed")
+                with row_cols[1]:
+                    st.write(row["label"])
+                with row_cols[2]:
+                    st.write(str(row["start"])[:10])
+                with row_cols[3]:
+                    st.write(str(row["end"])[:10])
+                with row_cols[4]:
+                    if row.get("source", "default") == "manual":
+                        st.markdown(
+                            '<span style="font-size:11px; background:#EFF6FF; color:#1D4ED8; padding:2px 8px; border-radius:6px;">manual</span>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(
+                            '<span style="font-size:11px; background:#F3F4F6; color:#6B7280; padding:2px 8px; border-radius:6px;">default</span>',
+                            unsafe_allow_html=True,
+                        )
+                with row_cols[5]:
+                    if row.get("source", "default") == "manual":
+                        if st.button(
+                            "✕",
+                            key=f"del_camp_{i}",
+                            help="Remove this campaign",
+                            type="secondary",
+                        ):
+                            st.session_state["campaign_manual_list"].pop(row["manual_index"])
+                            st.rerun()
+
+                if row.get("source") == "manual":
+                    new_manual_list.append(
+                        {
+                            "start": row["start"],
+                            "end": row["end"],
+                            "label": row["label"],
+                            "include": checked,
+                        }
+                    )
+
+        st.session_state["selected_campaign_labels"] = [
+            all_campaign_rows[i]["label"]
+            for i in range(len(all_campaign_rows))
+            if st.session_state.get(f"chk_camp_{i}", True)
+        ]
+        st.session_state["campaign_manual_list"] = new_manual_list
+
+        manual_df_rows = [r for r in new_manual_list if r["include"]]
+        st.session_state["campaign_manual"] = pd.DataFrame(manual_df_rows, columns=["start", "end", "label"])
+
+        # PART 2 — Add Custom Campaign
+        st.markdown('<hr style="margin: 16px 0;">', unsafe_allow_html=True)
+        st.markdown("### Add Custom Campaign")
+        col1, col2, col3 = st.columns([2, 2, 3])
+        with col1:
+            new_start = st.date_input("Start date", key="new_camp_start")
+        with col2:
+            new_end = st.date_input("End date", key="new_camp_end")
+        with col3:
+            new_label = st.text_input(
+                "Campaign name",
+                placeholder="e.g. Harbolnas 12.12",
+                key="new_camp_label",
+            )
+            st.caption("👆 Click '➕ Add campaign' button below to save.")
+
+        if st.button("➕ Add campaign", key="btn_add_campaign", use_container_width=True, type="secondary"):
+            if not new_label.strip():
+                st.error("Please enter a campaign name.")
+            elif new_end < new_start:
+                st.error("End date must be after start date.")
+            else:
+                st.session_state["campaign_manual_list"].append({
+                    "label": new_label.strip(),
+                    "start": pd.to_datetime(new_start).normalize(),
+                    "end": pd.to_datetime(new_end).normalize(),
+                    "source": "manual",
+                    "include": True,
+                })
+                if "new_camp_label" in st.session_state:
+                    del st.session_state["new_camp_label"]
+                st.rerun()
 
 with tab2:
     st.subheader("E-commerce Holidays")
+    st.caption("Single dates that affect buying behavior — e.g. Ramadhan, Lebaran, Christmas.")
+
     if st.button("Refresh default e-commerce holidays from backend CSV", key="btn_refresh_ecomm_holidays"):
         try:
             st.session_state["ecommerce_holiday_defaults"] = _load_ecommerce_holidays_csv()
@@ -1569,48 +1577,150 @@ with tab2:
     if st.session_state["ecommerce_holiday_load_error"]:
         st.error(_friendly_config_error(st.session_state["ecommerce_holiday_load_error"], kind="holiday"))
         st.info("Holiday options will appear here once the holiday file is available.")
-        default_holidays = pd.DataFrame(columns=["holiday", "ds"])
     else:
-        default_holidays = st.session_state["ecommerce_holiday_defaults"]
-        st.caption("Default e-commerce holidays from backend (read-only)")
-        st.dataframe(default_holidays, use_container_width=True)
+        # Load defaults
+        default_hols = st.session_state.get("ecommerce_holiday_defaults", pd.DataFrame()).copy()
+        if default_hols.empty:
+            default_hols = pd.DataFrame(columns=["holiday", "ds"])
 
-    default_holiday_names = default_holidays["holiday"].dropna().unique().tolist()
-    st.session_state["selected_ecommerce_holidays"] = st.multiselect(
-        "Default holiday names to include",
-        options=default_holiday_names,
-        default=st.session_state.get("selected_ecommerce_holidays") or default_holiday_names,
-        key="multiselect_default_holidays",
-        help="Choose which backend default holidays to include.",
-    )
+        if "selected_ecommerce_holidays" not in st.session_state or st.session_state["selected_ecommerce_holidays"] is None:
+            st.session_state["selected_ecommerce_holidays"] = default_hols["holiday"].dropna().unique().tolist()
 
-    with st.expander("\u2795 Add holiday dates manually", expanded=False):
-        st.caption("Manually add holiday dates (date format, same style as campaign dates)")
-        manual_holidays = st.data_editor(
-            st.session_state["ecommerce_holiday_manual"],
-            column_config={
-                "holiday": st.column_config.TextColumn("Holiday"),
-                "ds": st.column_config.DateColumn("Date"),
-            },
-            num_rows="dynamic",
-            use_container_width=True,
-            key="editor_manual_holidays",
+        manual_hols_list = st.session_state.get("holiday_manual_list", [])
+
+        all_holiday_rows: list[dict[str, Any]] = []
+        for _, row in default_hols.iterrows():
+            all_holiday_rows.append(
+                {
+                    "holiday": row["holiday"],
+                    "ds": row["ds"],
+                    "source": "default",
+                }
+            )
+        for idx, m_row in enumerate(manual_hols_list):
+            all_holiday_rows.append(
+                {
+                    "holiday": m_row["holiday"],
+                    "ds": m_row["ds"],
+                    "source": "manual",
+                    "manual_index": idx,
+                }
+            )
+
+        for i in range(len(all_holiday_rows)):
+            if f"chk_hol_{i}" not in st.session_state:
+                st.session_state[f"chk_hol_{i}"] = True
+
+        all_selected = all(
+            st.session_state.get(f"chk_hol_{i}", True) for i in range(len(all_holiday_rows))
         )
-    manual_holidays["holiday"] = manual_holidays["holiday"].astype(str).str.strip()
-    manual_holidays["ds"] = pd.to_datetime(manual_holidays["ds"], errors="coerce").dt.normalize()
-    manual_holidays = manual_holidays.dropna(subset=["holiday", "ds"])
-    manual_holidays = manual_holidays[manual_holidays["holiday"] != ""]
-    manual_holidays = manual_holidays.drop_duplicates(subset=["holiday", "ds"]).reset_index(drop=True)
-    st.session_state["ecommerce_holiday_manual"] = manual_holidays
+        btn_label = "Deselect all" if all_selected else "Select all"
+        if st.button(btn_label, key="btn_select_all_holidays"):
+            new_val = not all_selected
+            for i in range(len(all_holiday_rows)):
+                st.session_state[f"chk_hol_{i}"] = new_val
+            st.rerun()
 
-selected_defaults = default_holidays[default_holidays["holiday"].isin(st.session_state["selected_ecommerce_holidays"])]
-combined_holidays = (
-    pd.concat([selected_defaults, manual_holidays], ignore_index=True)
-    .drop_duplicates(subset=["holiday", "ds"])
-    .sort_values(["ds", "holiday"])
-    .reset_index(drop=True)
-)
-st.session_state["ecommerce_holidays"] = combined_holidays
+        st.write("")
+        col_inc, col_lbl, col_date, col_src, col_del = st.columns([0.5, 3, 2, 1, 0.5])
+        col_inc.markdown("**✓**")
+        col_lbl.markdown("**Holiday Name**")
+        col_date.markdown("**Date**")
+        col_src.markdown("**Source**")
+        col_del.markdown("")
+        st.markdown('<hr style="margin: 4px 0 8px 0;">', unsafe_allow_html=True)
+
+        new_manual_hols_list = []
+
+        with st.container(height=300):
+            for i, row in enumerate(all_holiday_rows):
+                row_cols = st.columns([0.5, 3, 2, 1, 0.5])
+                with row_cols[0]:
+                    checked = st.checkbox("", key=f"chk_hol_{i}", label_visibility="collapsed")
+                with row_cols[1]:
+                    st.write(row["holiday"])
+                with row_cols[2]:
+                    st.write(str(row["ds"])[:10])
+                with row_cols[3]:
+                    if row.get("source", "default") == "manual":
+                        st.markdown(
+                            '<span style="font-size:11px; background:#EFF6FF; color:#1D4ED8; padding:2px 8px; border-radius:6px;">manual</span>',
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.markdown(
+                            '<span style="font-size:11px; background:#F3F4F6; color:#6B7280; padding:2px 8px; border-radius:6px;">default</span>',
+                            unsafe_allow_html=True,
+                        )
+                with row_cols[4]:
+                    if row.get("source", "default") == "manual":
+                        if st.button(
+                            "✕",
+                            key=f"del_hol_{i}",
+                            help="Remove this holiday",
+                            type="secondary",
+                        ):
+                            st.session_state["holiday_manual_list"].pop(row["manual_index"])
+                            st.rerun()
+
+                if row.get("source") == "manual":
+                    new_manual_hols_list.append(
+                        {
+                            "holiday": row["holiday"],
+                            "ds": row["ds"],
+                            "include": checked,
+                        }
+                    )
+
+        st.session_state["selected_ecommerce_holidays"] = [
+            all_holiday_rows[i]["holiday"]
+            for i in range(len(all_holiday_rows))
+            if st.session_state.get(f"chk_hol_{i}", True)
+        ]
+        st.session_state["holiday_manual_list"] = new_manual_hols_list
+
+        manual_holidays_df_rows = [r for r in new_manual_hols_list if r["include"]]
+        manual_holidays = pd.DataFrame(manual_holidays_df_rows, columns=["holiday", "ds"])
+        st.session_state["ecommerce_holiday_manual"] = manual_holidays
+
+        # Perform combined_holidays calculation
+        default_holidays = st.session_state.get("ecommerce_holiday_defaults", pd.DataFrame())
+        selected_defaults = default_holidays[default_holidays["holiday"].isin(st.session_state["selected_ecommerce_holidays"])]
+        combined_holidays = (
+            pd.concat([selected_defaults, manual_holidays], ignore_index=True)
+            .drop_duplicates(subset=["holiday", "ds"])
+            .sort_values(["ds", "holiday"])
+            .reset_index(drop=True)
+        )
+        st.session_state["ecommerce_holidays"] = combined_holidays
+
+        # PART 2 — Add Custom Holiday
+        st.markdown('<hr style="margin: 16px 0;">', unsafe_allow_html=True)
+        st.markdown("### Add Custom Holiday")
+        col1, col2 = st.columns([3, 2])
+        with col1:
+            new_holiday = st.text_input(
+                "Holiday name",
+                placeholder="e.g. Lebaran 2025",
+                key="new_hol_name",
+            )
+            st.caption("👆 Click '➕ Add holiday' button below to save.")
+        with col2:
+            new_date = st.date_input("Date", key="new_hol_date")
+
+        if st.button("➕ Add holiday", key="btn_add_holiday", use_container_width=True, type="primary"):
+            if not new_holiday.strip():
+                st.error("Please enter a holiday name.")
+            else:
+                st.session_state["holiday_manual_list"].append({
+                    "holiday": new_holiday.strip(),
+                    "ds": pd.to_datetime(new_date).normalize(),
+                    "source": "manual",
+                    "include": True,
+                })
+                if "new_hol_name" in st.session_state:
+                    del st.session_state["new_hol_name"]
+                st.rerun()
 
 st.divider()
 
@@ -1620,71 +1730,110 @@ st.header("4. Model selection & evaluation settings")
 st.subheader("Forecast date range")
 df_mapped = st.session_state.get("df_mapped")
 if df_mapped is not None and not df_mapped.empty:
-    last_data_date = pd.to_datetime(df_mapped["ds"]).max().date()
-    default_start = last_data_date + pd.Timedelta(days=1)
-    default_end = default_start + pd.Timedelta(days=30)
-    
-    col_d1, col_d2 = st.columns(2)
-    with col_d1:
-        start_date = st.date_input(
-            "Forecast Start Date",
-            value=st.session_state.get("forecast_start_date") or default_start,
-            min_value=default_start,
-            key="input_start_date",
-        )
-        st.session_state["forecast_start_date"] = start_date
-    with col_d2:
-        end_date = st.date_input(
-            "Forecast End Date",
-            value=st.session_state.get("forecast_end_date") or default_end,
-            min_value=start_date,
-            key="input_end_date",
-        )
-        st.session_state["forecast_end_date"] = end_date
-    
-    # Validation Logic
-    st.session_state["forecast_date_error"] = None
-    if start_date <= last_data_date:
-        st.session_state["forecast_date_error"] = f"Forecast Start Date must be after the last historical date ({last_data_date})."
-    elif end_date <= start_date:
-        st.session_state["forecast_date_error"] = "Forecast End Date must be after the Forecast Start Date."
-    
-    if st.session_state["forecast_date_error"]:
-        st.error(st.session_state["forecast_date_error"])
-    else:
-        # Calculate periods for internal use
-        forecast_horizon = (end_date - last_data_date).days
-        st.caption(f"Forecast will cover **{forecast_horizon}** days beyond the last historical date ({last_data_date}).")
+    try:
+        last_data_date = pd.to_datetime(df_mapped["ds"]).max().date()
+        default_start = last_data_date + pd.Timedelta(days=1)
+        default_end = default_start + pd.Timedelta(days=30)
         
-        # Long horizon warning (> 3 years / 1095 days)
-        if forecast_horizon > 1095:
-            st.warning("Forecast horizon too long (> 3 years). Forecast accuracy may decrease.")
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            start_date = st.date_input(
+                "Forecast Start Date",
+                value=st.session_state.get("forecast_start_date") or default_start,
+                min_value=default_start,
+                key="input_start_date",
+            )
+            st.session_state["forecast_start_date"] = start_date
+
+        stored_end = st.session_state.get("forecast_end_date")
+        if stored_end is not None and stored_end <= start_date:
+            st.session_state["forecast_end_date"] = start_date + pd.Timedelta(days=30)
+
+        with col_d2:
+            end_date = st.date_input(
+                "Forecast End Date",
+                value=st.session_state.get("forecast_end_date") or default_end,
+                min_value=start_date,
+                key="input_end_date",
+            )
+            st.session_state["forecast_end_date"] = end_date
+        
+        # Validation Logic
+        st.session_state["forecast_date_error"] = None
+        if start_date <= last_data_date:
+            st.caption(f"📅 Forecast must start after your last data point ({last_data_date}).")
+        elif end_date <= start_date:
+            st.session_state["forecast_date_error"] = "Forecast End Date must be after the Forecast Start Date."
+        
+        if st.session_state["forecast_date_error"]:
+            st.error(st.session_state["forecast_date_error"])
+        else:
+            # Calculate periods for internal use
+            forecast_horizon = (end_date - last_data_date).days
+            st.caption(f"Forecast will cover **{forecast_horizon}** days beyond the last historical date ({last_data_date}).")
+            
+            # Long horizon warning (> 3 years / 1095 days)
+            if forecast_horizon > 1095:
+                st.warning("Forecast horizon too long (> 3 years). Forecast accuracy may decrease.")
+    except Exception:
+        st.session_state["forecast_start_date"] = None
+        st.session_state["forecast_end_date"] = None
+        st.error(
+            "⚠️ Date range was reset because of a conflict. Please select your forecast dates again."
+        )
 else:
     st.info("Map your data in step 2 to select a forecast date range.")
 
-st.session_state["auto_select_all_models"] = st.checkbox(
-    "Auto Select All models",
-    value=st.session_state["auto_select_all_models"],
-    key="chk_auto_models",
-    help="When enabled, all models below are used regardless of the multiselect.",
-)
+for m in MODEL_OPTIONS:
+    if f"model_chk_{m}" not in st.session_state:
+        st.session_state[f"model_chk_{m}"] = True
 
-if st.session_state["auto_select_all_models"]:
-    st.session_state["selected_models"] = list(MODEL_OPTIONS)
-    st.multiselect(
-        "Models (all selected)",
-        options=MODEL_OPTIONS,
-        default=MODEL_OPTIONS,
-        disabled=True,
-        key="models_disabled_display",
-    )
-else:
-    st.session_state["selected_models"] = st.multiselect(
-        "Models to train & compare",
-        options=MODEL_OPTIONS,
-        default=st.session_state.get("selected_models") or ["Prophet"],
-        key="multiselect_models",
-    )
+MODEL_SHORT_DESC = {
+    "Prophet": "Seasonal + campaigns",
+    "ARIMA": "Statistical baseline",
+    "ETS": "Weighted recent history",
+    "Linear Regression": "Interpretable, 45+ days",
+    "XGBoost": "Complex patterns",
+}
+
+selected_count = sum(
+    1 for m in MODEL_OPTIONS if st.session_state.get(f"model_chk_{m}", True)
+)
+all_selected = selected_count == len(MODEL_OPTIONS)
+
+col_title, col_btn = st.columns([4, 1])
+with col_title:
+    st.markdown("**Models to compare**")
+with col_btn:
+    btn_label = "Deselect all" if all_selected else "Select all"
+    if st.button(btn_label, key="btn_toggle_all_models", use_container_width=True):
+        new_val = not all_selected
+        for m in MODEL_OPTIONS:
+            st.session_state[f"model_chk_{m}"] = new_val
+        st.rerun()
+
+rows = [MODEL_OPTIONS[i : i + 3] for i in range(0, len(MODEL_OPTIONS), 3)]
+
+for row in rows:
+    cols = st.columns(3)
+    for j, model_name in enumerate(row):
+        with cols[j]:
+            with st.container(border=True):
+                checked = st.checkbox(
+                    f"**{model_name}**",
+                    key=f"model_chk_{model_name}",
+                )
+                st.caption(MODEL_SHORT_DESC.get(model_name, ""))
+
+selected_models = [
+    m for m in MODEL_OPTIONS if st.session_state.get(f"model_chk_{m}", True)
+]
+st.session_state["selected_models"] = selected_models
+
+st.caption(f"{len(selected_models)} of {len(MODEL_OPTIONS)} models selected")
+
+if not selected_models:
+    st.warning("Please select at least one model to run the forecast.")
 
 with st.expander("What do these models mean? \U0001F4A1"):
     st.markdown(
@@ -1696,66 +1845,52 @@ with st.expander("What do these models mean? \U0001F4A1"):
     )
 
 st.session_state["selected_metric"] = st.selectbox(
-    "How should we measure forecast accuracy?",
+    "Accuracy metric",
     options=METRIC_OPTIONS,
     index=METRIC_OPTIONS.index(st.session_state.get("selected_metric", "MAPE")),
     key="select_metric",
     format_func=lambda metric: METRIC_DISPLAY_NAMES.get(metric, metric),
 )
 
-# Dynamic UI for Metric Thresholds
-st.subheader("Threshold Range")
-metric_rules = st.session_state.get("metric_rules", {})
+METRIC_INFO = {
+    "MAPE": {
+        "name": "Mean Absolute Percentage Error",
+        "explain": "Measures average % error. Easy to interpret across different data scales.",
+        "bands": [
+            (0.10, "✅ Excellent", "Model is off by less than 10% on average."),
+            (0.20, "✅ Good", "Acceptable for most forecasting use cases."),
+            (0.35, "⚠️ Fair", "Consider adding more history or adjusting campaigns."),
+            (float("inf"), "❌ Poor", "Forecast may not be reliable. Check your data quality."),
+        ],
+    },
+    "MAE": {
+        "name": "Mean Absolute Error",
+        "explain": "Average error in the same unit as your data (e.g. if forecasting sales in IDR, MAE is in IDR).",
+        "bands": None,
+    },
+    "RMSE": {
+        "name": "Root Mean Squared Error",
+        "explain": "Like MAE but penalises large errors more heavily. Same unit as your data.",
+        "bands": None,
+    },
+    "MSE": {
+        "name": "Mean Squared Error",
+        "explain": "Squared unit — best used for comparing models, not for interpreting the actual error size.",
+        "bands": None,
+    },
+}
+
 m = st.session_state["selected_metric"]
-
-# Update metric_rules for the selected metric
-if m in metric_rules and "min" in metric_rules[m]:
-    current_rule = metric_rules[m]
-else:
-    # Defaults (Range: 0 to 0.15 for MAPE, 0 to 100 for others)
-    current_rule = {"min": 0.0, "max": 0.15 if m == "MAPE" else 100.0}
-
-with st.expander(f"Adjust thresholds for {m}", expanded=True):
-    # Slider for range adjustment
-    r_min = 0.0
-    r_max = 1.0 if m == "MAPE" else 1000.0
-    
-    # Synchronization callbacks for slider and number inputs
-    def sync_from_slider():
-        st.session_state[f"min_thr_{m}"] = st.session_state[f"slider_{m}"][0]
-        st.session_state[f"max_thr_{m}"] = st.session_state[f"slider_{m}"][1]
-
-    def sync_to_slider():
-        st.session_state[f"slider_{m}"] = (st.session_state[f"min_thr_{m}"], st.session_state[f"max_thr_{m}"])
-
-    range_val = st.slider(
-        f"Adjust {m} Range",
-        min_value=r_min,
-        max_value=r_max,
-        step=0.01 if m == "MAPE" else 1.0,
-        key=f"slider_{m}",
-        on_change=sync_from_slider
+info = METRIC_INFO[m]
+st.caption(f"**{info['name']}** — {info['explain']}")
+if info["bands"]:
+    st.caption(
+        "Score guide: "
+        + " · ".join(
+            [f"{label} (< {int(b * 100)}%)" for b, label, _ in info["bands"][:-1]]
+            + ["❌ Poor (above 35%)"]
+        )
     )
-
-    # Side-by-side inputs
-    c1, c2 = st.columns(2)
-    with c1:
-        m_min = st.number_input(
-            f"Min {m}",
-            step=0.01 if m == "MAPE" else 1.0,
-            key=f"min_thr_{m}",
-            on_change=sync_to_slider
-        )
-    with c2:
-        m_max = st.number_input(
-            f"Max {m}",
-            step=0.01 if m == "MAPE" else 1.0,
-            key=f"max_thr_{m}",
-            on_change=sync_to_slider
-        )
-
-    # Update rule in session state
-    st.session_state["metric_rules"] = {m: {"min": m_min, "max": m_max}}
 st.divider()
 
 # --------------------------------------------------------------------------- 5
@@ -1763,7 +1898,11 @@ st.header("5. Run forecast")
 st.markdown("We'll train each selected model, compare their accuracy, and automatically pick the best one for your data.")
 st.caption("\u23F1 Estimated run time: Prophet + XGBoost may take 2-5 minutes on large datasets or many series. ARIMA, ETS, and Linear Regression are typically faster.")
 
-run_disabled = st.session_state["df_mapped"] is None or not st.session_state["selected_models"] or st.session_state.get("forecast_date_error") is not None
+run_disabled = (
+    st.session_state["df_mapped"] is None
+    or not st.session_state["selected_models"]
+    or st.session_state.get("forecast_date_error") is not None
+)
 if run_disabled:
     if st.session_state.get("forecast_date_error"):
         st.warning("Fix the forecast date errors in step 4 to enable the run.")
@@ -1800,7 +1939,6 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
             st.stop()
 
         primary_metric = st.session_state.get("selected_metric", "MAPE")
-        metric_rules = st.session_state.get("metric_rules", {})
         model_results = {}
         total_steps = len(selected_models)
         completed = 0
@@ -2108,22 +2246,7 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
             }
             st.stop()
 
-        # Validation Logic: Find models that pass ALL rules
-        models_passing = []
-        for m_name, res in model_results.items():
-            if _check_metric_rules(res["all_metrics"], metric_rules):
-                models_passing.append(m_name)
-        
-        msg_prefix = ""
-        if not models_passing:
-            msg_prefix = "No model met all metric thresholds. Showing best available model based on primary metric. "
-            # If none pass, pick the best based on primary_metric (already tracked by 'score')
-            best_model_name = min(model_results, key=lambda k: model_results[k]["score"])
-            threshold_passed = False
-        else:
-            # If multiple pass, pick the best among them based on primary_metric
-            best_model_name = min(models_passing, key=lambda k: model_results[k]["score"])
-            threshold_passed = True
+        best_model_name = min(model_results, key=lambda k: model_results[k]["score"])
 
         best_res = model_results[best_model_name]
         best_score = best_res["score"]
@@ -2156,6 +2279,13 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
             elif best_model_name == "ETS":
                 future_forecast, _ = _fit_ets_full(mapped, best_params, f_start, f_end)
             elif best_model_name in ["Linear Regression", "XGBoost"]:
+                ml_horizon = (pd.to_datetime(f_end) - pd.to_datetime(f_start)).days
+                if ml_horizon > 30:
+                    st.warning(
+                        f"⚠️ {best_model_name} is most accurate for short-term forecasts (up to 30 days). "
+                        f"Your selected horizon is {ml_horizon} days — consider using Prophet or ARIMA for "
+                        f"longer forecasts, or reduce your forecast end date."
+                    )
                 future_forecast = _fit_ml_full(mapped, best_params, f_start, f_end)
 
         series_names = sorted(
@@ -2179,21 +2309,20 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
             "yhat_upper": "Predicted (High)",
         })
 
-        msg = msg_prefix + best_res["message"]
+        msg = best_res["message"]
         other_selected = [m for m in selected_models if m not in model_results]
         if other_selected:
             msg += f" Note: other selected models ({', '.join(other_selected)}) failed."
 
         st.session_state["forecast_run_done"] = True
         st.session_state["results_placeholder"] = {
-            "best_model": best_model_name if threshold_passed else best_model_name + " (Best Available)",
+            "best_model": best_model_name,
             "metric_scores": best_res["all_metrics"],
             "all_model_results": model_results, # Store all results for details table
             "primary_metric": primary_metric,
             "series_names": series_names,
             "validation_df": validation_forecast,
             "forecast_df": future_forecast, # This is the future forecast
-            "threshold_passed": threshold_passed,
             "message": msg,
         }
 
@@ -2201,6 +2330,8 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
 st.divider()
 
 # --------------------------------------------------------------------------- 6
+import plotly.graph_objects as go
+
 st.header("6. Results")
 
 if not st.session_state.get("forecast_run_done"):
@@ -2220,32 +2351,102 @@ else:
     with c2:
         st.metric(label=f"📈 {METRIC_DISPLAY_NAMES.get(primary_m, primary_m)}", value=f"{primary_val:.4g}")
 
-    if res.get("threshold_passed"):
-        st.markdown(
-            """
-<div style="background-color:#D1FAE5; padding:16px;
-border-radius:8px; border-left:4px solid #10B981;">
-<h3 style="color:#065F46; margin:0;">
-\u2705 Best Model: {best_model_name}</h3>
-<p style="color:#065F46; margin:4px 0 0 0;">
-Passed all accuracy thresholds.</p>
-</div>
-""".format(best_model_name=res.get("best_model")),
-            unsafe_allow_html=True,
-        )
+    score = primary_val
+    if primary_m == "MAPE":
+        if score < 0.10:
+            st.success(f"✅ Excellent — model is off by {score:.1%} on average.")
+        elif score < 0.20:
+            st.success(f"✅ Good — {score:.1%} average error, acceptable for most use cases.")
+        elif score < 0.35:
+            st.warning(f"⚠️ Fair — {score:.1%} average error. Consider adding more history.")
+        else:
+            st.error(f"❌ Poor — {score:.1%} average error. Forecast may not be reliable.")
     else:
-        st.markdown(
-            """
-<div style="background-color:#FEE2E2; padding:16px;
-border-radius:8px; border-left:4px solid #991B1B;">
-<h3 style="color:#991B1B; margin:0;">
-\u26A0\uFE0F Best Model: {best_model_name}</h3>
-<p style="color:#991B1B; margin:4px 0 0 0;">
-Best available \u2014 threshold not met.</p>
-</div>
-""".format(best_model_name=res.get("best_model")),
-            unsafe_allow_html=True,
+        st.info(
+            f"**{primary_m} = {score:,.2f}** — measured in the same unit as your data. "
+            "Compare across models to find the best performer."
         )
+
+    all_models = res.get("all_model_results", {})
+    best_model_name = res.get("best_model", "").replace(" (Best Available)", "")
+
+    if all_models and len(all_models) > 1:
+        model_scores = {
+            name: info.get("all_metrics", {}).get(primary_m, float("inf"))
+            for name, info in all_models.items()
+            if primary_m in info.get("all_metrics", {})
+        }
+
+        model_scores = {
+            name: score
+            for name, score in model_scores.items()
+            if np.isfinite(score)
+        }
+
+        if len(model_scores) > 1 and best_model_name in model_scores:
+            best_score = model_scores[best_model_name]
+            sorted_models = sorted(model_scores.items(), key=lambda x: x[1])
+
+            unique_scores = {score for _, score in sorted_models}
+            if len(unique_scores) == 1:
+                st.info(f"All models performed equally on {primary_m}.")
+            else:
+                runner_up = [(name, score) for name, score in sorted_models if name != best_model_name]
+
+                if runner_up:
+                    runner_name, runner_score = runner_up[0]
+                    if runner_score > 0 and np.isfinite(runner_score):
+                        improvement = ((runner_score - best_score) / runner_score) * 100
+                        st.info(
+                            f"🏆 **{best_model_name}** is the best performer — **{improvement:.0f}% more "
+                            f"accurate** than the runner-up ({runner_name}) based on {primary_m}."
+                        )
+            with st.expander("See full model ranking", expanded=False):
+                col_rank, col_name, col_score, col_diff = st.columns([0.5, 2, 1.5, 1.5])
+                with col_rank:
+                    st.markdown("**#**")
+                with col_name:
+                    st.markdown("**Model**")
+                with col_score:
+                    st.markdown(f"**{primary_m} Score**")
+                with col_diff:
+                    st.markdown("**vs Best**")
+
+                st.divider()
+
+                for rank, (name, score) in enumerate(sorted_models, 1):
+                    if not np.isfinite(score):
+                        continue
+
+                    medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}.")
+
+                    if name == best_model_name:
+                        diff_str = "← best"
+                        diff_color = "green"
+                    else:
+                        if unique_scores and len(unique_scores) == 1:
+                            diff_str = "← tied"
+                        elif best_score > 0 and np.isfinite(best_score):
+                            pct_worse = ((score - best_score) / best_score) * 100
+                            diff_str = f"+{pct_worse:.0f}% worse"
+                        else:
+                            diff_str = "worse"
+                        diff_color = "red"
+
+                    col_rank, col_name, col_score, col_diff = st.columns([0.5, 2, 1.5, 1.5])
+                    with col_rank:
+                        st.write(medal)
+                    with col_name:
+                        st.write(f"**{name}**" if name == best_model_name else name)
+                    with col_score:
+                        if primary_m == "MAPE":
+                            st.write(f"{score:.1%}")
+                        else:
+                            st.write(f"{score:,.2f} {primary_m}")
+                    with col_diff:
+                        st.markdown(f":{diff_color}[{diff_str}]")
+        elif len(model_scores) <= 1:
+            st.info("Run more models to compare.")
 
     df_val = res.get("validation_df")
     df_future = res.get("forecast_df")
@@ -2282,10 +2483,20 @@ Best available \u2014 threshold not met.</p>
 
     if res.get("message"):
         st.warning(res["message"])
-    if res.get("threshold_passed") is False:
-        st.error(
-            f"Validation threshold not met for {primary_m}. "
-            "Tune parameters / adjust `metric threshold`, or improve data quality."
+
+    best_model_name = (res.get("best_model") or "").replace(" (Best Available)", "")
+    forecast_start_date = st.session_state.get("forecast_start_date")
+    forecast_end_date = st.session_state.get("forecast_end_date")
+    if (
+        best_model_name in ["Linear Regression", "XGBoost"]
+        and forecast_start_date is not None
+        and forecast_end_date is not None
+        and (pd.to_datetime(forecast_end_date) - pd.to_datetime(forecast_start_date)).days > 30
+    ):
+        st.info(
+            "💡 This forecast extends beyond 30 days. ML models like Linear Regression and XGBoost "
+            "may become less reliable over longer horizons as prediction errors compound over time. "
+            "The first 30 days are most reliable."
         )
 
     # --- NEW: Model Details Expander ---
@@ -2294,17 +2505,36 @@ Best available \u2014 threshold not met.</p>
         with st.expander("Model Details", expanded=False):
             st.markdown("Comparison of all evaluated models based on their validation metrics and parameters.")
             
+            def format_params(model_name, params):
+                if model_name == "Prophet":
+                    return (
+                        f"CP={params.get('changepoint_prior_scale', '?')}, "
+                        f"SP={params.get('seasonality_prior_scale', '?')}, "
+                        f"Mode={params.get('seasonality_mode', '?')}, "
+                        f"Growth={params.get('growth', '?')}"
+                    )
+                if model_name == "ARIMA":
+                    if isinstance(params, dict):
+                        first = next(iter(params.values()), {})
+                        return f"p={first.get('p', '?')}, d={first.get('d', '?')}, q={first.get('q', '?')}"
+                    return "auto-selected"
+                if model_name == "ETS":
+                    if isinstance(params, dict):
+                        first = next(iter(params.values()), {})
+                        return (
+                            f"Trend={first.get('trend', 'None')}, "
+                            f"Seasonal={first.get('seasonal', 'None')}, "
+                            f"Period={first.get('seasonal_periods', 'None')}"
+                        )
+                    return "auto-selected"
+                if model_name in ["Linear Regression", "XGBoost"]:
+                    return "feature-based (lag 1/7/30, rolling mean)"
+                return str(params)[:50]
+
             summary_data = []
             for m_name, m_info in all_models.items():
-                # Format parameters for display
                 params = m_info.get("best_params", {})
-                if isinstance(params, dict):
-                    # For Prophet/ETS, params is a dict
-                    param_str = ", ".join([f"{k}: {v}" for k, v in params.items()])
-                else:
-                    # For others, it might be the model object or list
-                    param_str = str(params)
-                
+                param_str = format_params(m_name, params)
                 row = {
                     "Model": m_name,
                     "Parameters": param_str,
@@ -2316,18 +2546,12 @@ Best available \u2014 threshold not met.</p>
                 summary_data.append(row)
             
             df_summary = pd.DataFrame(summary_data)
-            
-            # Highlight the best model
             best_model_raw = res.get("best_model", "").replace(" (Best Available)", "")
-            
-            def highlight_best(row):
-                return ['background-color: #d4edda' if row.Model == best_model_raw else '' for _ in row]
-            
-            st.dataframe(
-                df_summary.style.apply(highlight_best, axis=1),
-                use_container_width=True,
-                hide_index=True
+            df_summary["Model"] = df_summary["Model"].apply(
+                lambda x: f"★ {x}" if x == best_model_raw else x
             )
+
+            st.dataframe(df_summary, use_container_width=True, hide_index=True)
 
     st.subheader("Actual vs Forecast Analysis")
     res = st.session_state.get("results_placeholder") or {}
@@ -2345,18 +2569,161 @@ Best available \u2014 threshold not met.</p>
                 # Combine for plotting
                 s_plot = s_hist.join(s_fut, how="outer")
                 
-                # To ensure visual continuity, the forecast line should "connect" to the last historical point.
-                # We can do this by filling the first NaN in 'Forecast' with the last available 'Actual'.
                 last_hist_date = s_hist.index.max()
-                if last_hist_date in s_plot.index:
-                    last_val = s_plot.loc[last_hist_date, "Actual"]
-                    s_plot.loc[last_hist_date, "Forecast"] = last_val
+                first_forecast_date = s_fut.index.min() if not s_fut.empty else None
+                gap_days = None
+                forecast_x = s_fut.index
+                forecast_y = s_fut["Forecast"]
+                if first_forecast_date is not None:
+                    gap_days = (first_forecast_date - pd.Timestamp(last_hist_date)).days
+
+                    if gap_days <= 3:
+                        # Connect smoothly — forecast starts right after historical
+                        if last_hist_date in s_plot.index:
+                            last_val = s_plot.loc[last_hist_date, "Actual"]
+                            s_plot.loc[last_hist_date, "Forecast"] = last_val
+                        bridge = pd.DataFrame(
+                            {"Forecast": [s_hist["Actual"].iloc[-1]]},
+                            index=[s_hist.index.max()],
+                        )
+                        s_fut_connected = pd.concat([bridge, s_fut])
+                        forecast_x = s_fut_connected.index.astype(str)
+                        forecast_y = s_fut_connected["Forecast"]
+                    else:
+                        # Gap exists — do NOT draw connecting line
+                        # Leave forecast disconnected from historical so user sees there is a gap period
+                        pass
 
                 st.markdown(f"### {s} - Forecast Trend (Historical + Future)")
-                # Using st.line_chart with custom color mapping via a workaround or switching to a more flexible plotter
-                # Streamlit's st.line_chart uses a default color palette. 
-                # To get specific colors (Blue for Actual, Orange for Forecast), we'll use st.area_chart or st.line_chart with a color parameter
-                st.line_chart(s_plot, color=["#1f77b4", "#ff7f0e"]) # Standard Blue and Orange hex codes
+                fig = go.Figure()
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=s_hist.index.astype(str),
+                        y=s_hist["Actual"],
+                        name="Actual",
+                        line=dict(color="#1f77b4", width=2),
+                        mode="lines",
+                    )
+                )
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=pd.Index(forecast_x).astype(str),
+                        y=forecast_y,
+                        name="Forecast",
+                        line=dict(color="#ff7f0e", width=2),
+                        mode="lines",
+                    )
+                )
+
+                all_values = pd.concat([s_hist["Actual"], forecast_y]).dropna()
+                if not all_values.empty:
+                    y_min = all_values.min() * 0.95
+                    y_max = all_values.max() * 1.05
+                    fig.update_layout(
+                        yaxis=dict(
+                            range=[y_min, y_max]
+                        )
+                    )
+
+                if not s_fut.empty:
+                    forecast_start = s_fut.index.min()
+                    forecast_start_str = str(forecast_start.date())
+                    fig.add_shape(
+                        type="line",
+                        x0=forecast_start_str,
+                        x1=forecast_start_str,
+                        y0=0,
+                        y1=1,
+                        xref="x",
+                        yref="paper",
+                        line=dict(
+                            dash="dash",
+                            color="gray",
+                            width=1,
+                        ),
+                    )
+                    fig.add_annotation(
+                        x=forecast_start_str,
+                        y=1,
+                        xref="x",
+                        yref="paper",
+                        text="Forecast starts",
+                        showarrow=False,
+                        xanchor="left",
+                        yanchor="bottom",
+                        font=dict(size=11, color="gray"),
+                    )
+
+                if (
+                    best_model_name in ["Linear Regression", "XGBoost"]
+                    and forecast_start_date is not None
+                    and forecast_end_date is not None
+                    and (pd.to_datetime(forecast_end_date) - pd.to_datetime(forecast_start_date)).days > 30
+                ):
+                    thirty_day_mark = pd.to_datetime(forecast_start_date) + pd.Timedelta(days=30)
+                    thirty_day_mark_str = str(thirty_day_mark.date())
+                    fig.add_shape(
+                        type="line",
+                        x0=thirty_day_mark_str,
+                        x1=thirty_day_mark_str,
+                        y0=0,
+                        y1=1,
+                        xref="x",
+                        yref="paper",
+                        line=dict(
+                            dash="dot",
+                            color="orange",
+                            width=1,
+                        ),
+                    )
+                    fig.add_annotation(
+                        x=thirty_day_mark_str,
+                        y=1,
+                        xref="x",
+                        yref="paper",
+                        text="Reliability drops here",
+                        showarrow=False,
+                        xanchor="left",
+                        yanchor="bottom",
+                        font=dict(size=10, color="orange"),
+                    )
+
+                if first_forecast_date is not None and gap_days is not None and gap_days > 3:
+                    gap_start = (last_hist_date + pd.Timedelta(days=1)).strftime("%d %b %Y")
+                    gap_end = first_forecast_date.strftime("%d %b %Y")
+                    st.caption(
+                        f"⚠️ Gap between {gap_start} and {gap_end} is not forecasted — the model predicts from your selected start date onwards."
+                    )
+
+                fig.update_layout(
+                    title=f"{s} — Price Forecast",
+                    title_font_size=14,
+                    hovermode="x unified",
+                    legend=dict(
+                        orientation="h",
+                        yanchor="bottom",
+                        y=-0.2,
+                        xanchor="left",
+                        x=0,
+                    ),
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    height=400,
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(
+                        showgrid=True,
+                        gridcolor="rgba(128,128,128,0.1)",
+                    ),
+                    yaxis=dict(
+                        showgrid=True,
+                        gridcolor="rgba(128,128,128,0.1)",
+                        tickformat=",",
+                    ),
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
 
                 # 2. Validation Comparison Chart (Actual vs Projected)
                 if df_val is not None and not df_val.empty:
@@ -2381,22 +2748,24 @@ Best available \u2014 threshold not met.</p>
                     # Merge to get Date, Actual, Forecast
                     table_df = pd.merge(s_actuals, s_val[["Date", "Predicted"]], left_on="ds", right_on="Date", how="inner")
                     table_df = table_df.rename(columns={"y": "Actual", "Predicted": "Forecast"}).drop(columns=["ds"])
+                    table_df["Date"] = pd.to_datetime(table_df["Date"]).dt.strftime("%Y-%m-%d")
                     
                     # Calculate Error
                     table_df["Error"] = table_df["Actual"] - table_df["Forecast"]
                     table_df["Error %"] = (table_df["Error"] / table_df["Actual"]).abs() * 100
 
-                    def highlight_error_rows(row):
-                        error_pct = row.get("Error %")
-                        if pd.notna(error_pct) and error_pct > 20:
-                            return ["background-color: #FECACA"] * len(row)
-                        if pd.notna(error_pct) and error_pct <= 10:
-                            return ["background-color: #D1FAE5"] * len(row)
-                        return [""] * len(row)
+                    def get_status(error_pct):
+                        if error_pct <= 10:
+                            return "✅ Good"
+                        if error_pct <= 20:
+                            return "⚠️ Fair"
+                        return "❌ High"
+
+                    table_df["Status"] = table_df["Error %"].apply(get_status)
                     
                     st.markdown("### Validation Data (Actual vs Predicted)")
                     st.dataframe(
-                        table_df.style.apply(highlight_error_rows, axis=1).format({
+                        table_df.style.format({
                             "Actual": "{:,.2f}",
                             "Forecast": "{:,.2f}",
                             "Error": "{:,.2f}",
