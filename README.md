@@ -1,14 +1,14 @@
 # 📈 Forecast App
 
-An end-to-end, self-service forecasting platform built with Streamlit. Upload your data (or query BigQuery directly), configure campaigns and holidays, and let the app automatically train, tune, and compare **5 forecasting models** to find the best fit for your data.
+An end-to-end, self-service forecasting platform built with Streamlit. Upload your data, configure campaigns and holidays, and let the app automatically train, tune, and compare **5 forecasting models** to find the best fit for your data.
 
 ---
 
 ## ✨ Features
 
-- **Flexible data input** — upload CSV/XLSX or run a BigQuery SQL query
+- **Flexible data input** — upload CSV or XLSX files directly in the browser
 - **Multi-series forecasting** — forecast multiple metrics (e.g. products, regions) at once
-- **Campaign & holiday awareness** — Prophet uses campaign windows and e-commerce holidays as regressors
+- **Campaign & holiday awareness** — Prophet uses campaign windows and e-commerce holidays as regressors; other models do not use these inputs
 - **5 models compared automatically**:
   | Model | Best for |
   |---|---|
@@ -17,7 +17,7 @@ An end-to-end, self-service forecasting platform built with Streamlit. Upload yo
   | ETS | Weighted recent history, robust fallback |
   | Linear Regression | Interpretable, feature-based |
   | XGBoost | Complex non-linear patterns |
-- **Automatic model selection** — picks the best model based on your chosen accuracy metric and thresholds
+- **Automatic per-series model selection** — each metric independently picks its best model based on your chosen accuracy metric (MAPE, MAE, RMSE, or MSE)
 - **Validation & future forecasts** — see how the model performed historically, then view its forecast for your chosen date range
 - **Downloadable results** — export validation and forecast data as CSV
 
@@ -73,26 +73,20 @@ Christmas,2024-12-25
 
 The app follows a simple step-by-step workflow:
 
-1. **Data source** — Upload a file or connect to BigQuery
-2. **Schema mapping** — Tell the app which column is the date and which column(s) to forecast
-3. **Seasonality & holidays** — Select campaigns and holidays relevant to your data
-4. **Model settings** — Choose which models to run, your accuracy metric, thresholds, and forecast date range
+1. **Data source** — Upload a CSV or XLSX file
+2. **Data preview & schema mapping** — Preview your uploaded data, then tell the app which column is the date and which column(s) to forecast
+3. **Seasonality & holidays** — Select campaigns and holidays relevant to your data (used by Prophet only)
+4. **Model selection & evaluation settings** — Choose which models to run, your accuracy metric, and forecast date range
 5. **Run forecast** — The app trains, tunes, and compares all selected models
-6. **Results** — View charts, validation accuracy, and download forecasts
+6. **Results** — View per-series model rankings, charts, validation accuracy, and download forecasts
 
 ---
 
 ## 📊 Data Requirements
 
-- At least one **date column** and one **numeric metric column**
+- At least one **date column** and one **numeric metric column** (the app will flag an error if no numeric columns are detected on upload)
 - **Minimum 45 days** of history for Linear Regression / XGBoost to run
 - **180+ days recommended** for reliable forecasts across all models
-
----
-
-## 🔐 BigQuery Setup (Optional)
-
-If using the BigQuery option, you'll need to authenticate via Google OAuth in the app. For production deployments where multiple users share the app, consider using a **service account** stored in Streamlit Secrets instead of personal credentials — see `docs/bigquery-setup.md` *(if included)*.
 
 ---
 
@@ -104,15 +98,17 @@ If using the BigQuery option, you'll need to authenticate via Google OAuth in th
 - [statsmodels](https://www.statsmodels.org/) — ETS / Exponential Smoothing
 - [scikit-learn](https://scikit-learn.org/) — Linear Regression
 - [XGBoost](https://xgboost.readthedocs.io/) — gradient boosting
-- [pandas-gbq](https://googleapis.dev/python/pandas-gbq/latest/) — BigQuery integration
 
 ---
 
 ## ⚠️ Known Limitations
 
-- Linear Regression and XGBoost future forecasts use a simplified recursive approach (continuously refined)
-- ETS, Linear Regression, and XGBoost confidence intervals are approximate (±10%)
-- 180-day minimum history is recommended but not strictly enforced
+- **Long-horizon accuracy degrades** — all models use recursive (iterative) prediction, meaning each step's error compounds; forecasts beyond 30–60 days should be treated as directional
+- **Linear Regression and XGBoost are less reliable past 30 days** — lag and rolling features go stale over time; a dashed reliability line marks the 30-day point on the chart
+- **Confidence intervals are approximate** — they use bootstrapped/analytical estimates rather than full simulation, so bands may understate true uncertainty
+- **180-day history is recommended, not required** — shorter datasets will still run but may produce noisier models
+- **Campaigns and holidays only affect Prophet** — ARIMA, ETS, Linear Regression, and XGBoost do not use these inputs
+- **Per-series model selection** — when forecasting multiple metrics, each series independently picks its best model; a single global winner is shown only when all series agree
 
 ---
 
