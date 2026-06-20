@@ -62,10 +62,16 @@ def _load_uploaded_file(uploaded: Any) -> pd.DataFrame:
     if not raw:
         raise ValueError("The file is empty.")
     if name.endswith(".csv"):
-        return pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(io.BytesIO(raw))
-    raise ValueError("Unsupported format. Please upload a .csv or .xlsx file.")
+        df = pd.read_csv(io.BytesIO(raw), sep=None, engine="python")
+    elif name.endswith(".xlsx") or name.endswith(".xls"):
+        df = pd.read_excel(io.BytesIO(raw))
+    else:
+        raise ValueError("Unsupported format. Please upload a .csv or .xlsx file.")
+    if df.select_dtypes(include="number").empty:
+        raise ValueError(
+            "No numeric columns found. Please upload a file with at least one numeric column to use as a forecast metric."
+        )
+    return df
 
 
 def _load_bigquery(sql: str, project_id: str | None, credentials: Any = None) -> pd.DataFrame:
@@ -201,16 +207,6 @@ def _validate_mapped_df(df: pd.DataFrame) -> tuple[bool, str]:
     na_frac = y.isna().mean()
     if na_frac > 0.2:
         return False, f"Too much missing data found ({na_frac:.0%} of rows are empty). Please check your data and try again."
-    if "series" in df.columns:
-        counts = df.groupby("series")["ds"].nunique()
-        min_days = counts.min()
-        if min_days < 180:
-            return (
-                False,
-                f"Not enough history — your data only has {min_days} days. "
-                "We need at least 180 days for accurate forecasts."
-            )
-    
     return True, ""
 
 
@@ -321,7 +317,7 @@ def _fit_predict_prophet_validation(
 
     # Choose validation horizon based on series length.
     n = len(df_series)
-    validation_days = int(min(30, max(7, n * 0.2)))
+    validation_days = int(min(90, max(7, n * 0.2)))
     validation_days = max(1, validation_days)
     if n <= validation_days + 2:
         return float("inf"), pd.DataFrame(), None
@@ -390,7 +386,7 @@ def _fit_predict_arima_validation(
 
     # Choose validation horizon based on series length.
     n = len(df_series)
-    validation_days = int(min(30, max(7, n * 0.2)))
+    validation_days = int(min(90, max(7, n * 0.2)))
     validation_days = max(1, validation_days)
     if n <= validation_days + 2:
         return float("inf"), pd.DataFrame(), None
@@ -568,7 +564,7 @@ def _fit_predict_ets_validation(
         return float("inf"), pd.DataFrame(), None, {}
 
     n = len(df_series)
-    validation_days = int(min(30, max(7, n * 0.2)))
+    validation_days = int(min(90, max(7, n * 0.2)))
     validation_days = max(1, validation_days)
     if n <= validation_days + 2:  # Reduced requirement from +5 to +2
         return float("inf"), pd.DataFrame(), None, {}
@@ -601,23 +597,28 @@ def train_linear_regression(
     df["ds"] = pd.to_datetime(df["ds"])
     df = df.sort_values("ds").reset_index(drop=True)
 
+    n_train = len(train_df)
+
     # 1. Feature Engineering
     df["trend"] = range(len(df))
     df["day_of_week"] = df["ds"].dt.dayofweek
     df["month"] = df["ds"].dt.month
-    
-    # Lags
-    df["lag_1"] = df["y"].shift(1)
-    df["lag_7"] = df["y"].shift(7)
-    df["lag_30"] = df["y"].shift(30)
-    
-    # Rolling means
-    df["rolling_mean_7"] = df["y"].shift(1).rolling(window=7).mean()
-    df["rolling_mean_30"] = df["y"].shift(1).rolling(window=30).mean()
-    
+
+    # Build lag/rolling features using only training-period y values.
+    # Val-period positions are filled with the last known training value so that
+    # rolling windows cannot peek into the held-out data.
+    y_for_features = df["y"].copy()
+    y_for_features.iloc[n_train:] = y_for_features.iloc[n_train - 1]
+
+    df["lag_1"] = y_for_features.shift(1)
+    df["lag_7"] = y_for_features.shift(7)
+    df["lag_30"] = y_for_features.shift(30)
+    df["rolling_mean_7"] = y_for_features.shift(1).rolling(window=7).mean()
+    df["rolling_mean_30"] = y_for_features.shift(1).rolling(window=30).mean()
+
     # Drop rows where we don't have enough history for lags/rolling
     df_clean = df.dropna(subset=["lag_30", "rolling_mean_30"]).copy()
-    
+
     if df_clean.empty:
         return None, float("inf"), pd.DataFrame()
 
@@ -625,16 +626,16 @@ def train_linear_regression(
     val_dates = val_df["ds"].unique()
     train_final = df_clean[~df_clean["ds"].isin(val_dates)]
     val_final = df_clean[df_clean["ds"].isin(val_dates)]
-    
+
     if train_final.empty or val_final.empty:
         return None, float("inf"), pd.DataFrame()
 
     features = [
-        "trend", "day_of_week", "month", 
-        "lag_1", "lag_7", "lag_30", 
+        "trend", "day_of_week", "month",
+        "lag_1", "lag_7", "lag_30",
         "rolling_mean_7", "rolling_mean_30"
     ]
-    
+
     X_train = train_final[features]
     y_train = train_final["y"]
     X_val = val_final[features]
@@ -680,7 +681,7 @@ def _fit_predict_lr_validation(
     if n < 45:
         return float("inf"), pd.DataFrame(), None
 
-    validation_days = int(min(30, max(7, n * 0.2)))
+    validation_days = int(min(90, max(7, n * 0.2)))
     validation_days = max(1, validation_days)
     
     train_df = df_series.iloc[: n - validation_days]
@@ -711,23 +712,28 @@ def train_xgboost(
     df["ds"] = pd.to_datetime(df["ds"])
     df = df.sort_values("ds").reset_index(drop=True)
 
+    n_train = len(train_df)
+
     # 1. Feature Engineering (same logic as Linear Regression)
     df["trend"] = range(len(df))
     df["day_of_week"] = df["ds"].dt.dayofweek
     df["month"] = df["ds"].dt.month
-    
-    # Lags
-    df["lag_1"] = df["y"].shift(1)
-    df["lag_7"] = df["y"].shift(7)
-    df["lag_30"] = df["y"].shift(30)
-    
-    # Rolling means
-    df["rolling_mean_7"] = df["y"].shift(1).rolling(window=7).mean()
-    df["rolling_mean_30"] = df["y"].shift(1).rolling(window=30).mean()
-    
+
+    # Build lag/rolling features using only training-period y values.
+    # Val-period positions are filled with the last known training value so that
+    # rolling windows cannot peek into the held-out data.
+    y_for_features = df["y"].copy()
+    y_for_features.iloc[n_train:] = y_for_features.iloc[n_train - 1]
+
+    df["lag_1"] = y_for_features.shift(1)
+    df["lag_7"] = y_for_features.shift(7)
+    df["lag_30"] = y_for_features.shift(30)
+    df["rolling_mean_7"] = y_for_features.shift(1).rolling(window=7).mean()
+    df["rolling_mean_30"] = y_for_features.shift(1).rolling(window=30).mean()
+
     # Drop rows where we don't have enough history
     df_clean = df.dropna(subset=["lag_30", "rolling_mean_30"]).copy()
-    
+
     if df_clean.empty:
         return None, float("inf"), pd.DataFrame()
 
@@ -735,16 +741,16 @@ def train_xgboost(
     val_dates = val_df["ds"].unique()
     train_final = df_clean[~df_clean["ds"].isin(val_dates)]
     val_final = df_clean[df_clean["ds"].isin(val_dates)]
-    
+
     if train_final.empty or val_final.empty:
         return None, float("inf"), pd.DataFrame()
 
     features = [
-        "trend", "day_of_week", "month", 
-        "lag_1", "lag_7", "lag_30", 
+        "trend", "day_of_week", "month",
+        "lag_1", "lag_7", "lag_30",
         "rolling_mean_7", "rolling_mean_30"
     ]
-    
+
     X_train = train_final[features]
     y_train = train_final["y"]
     X_val = val_final[features]
@@ -812,7 +818,7 @@ def _fit_predict_xgboost_validation(
     if n < 45: # Need 30 for features + some training data
         return float("inf"), pd.DataFrame(), None
 
-    validation_days = int(min(30, max(7, n * 0.2)))
+    validation_days = int(min(90, max(7, n * 0.2)))
     validation_days = max(1, validation_days)
     
     train_df = df_series.iloc[: n - validation_days]
@@ -823,6 +829,65 @@ def _fit_predict_xgboost_validation(
         return float("inf"), pd.DataFrame(), None
         
     return metric, forecast_val, model
+
+
+def _run_model_validation(
+    model_name: str,
+    validation_fn,
+    mapped: pd.DataFrame,
+    primary_metric: str,
+    params_fn,
+    message_fn,
+) -> "dict | None":
+    """Run per-series validation for a model; return a model_results entry or None if every series fails.
+
+    validation_fn: called as validation_fn(df_series, metric_name=primary_metric)
+                   must return (score, forecast_val, *extra).
+    params_fn:     called as params_fn(*extra); return None to skip storing params for that series.
+    message_fn:    called as message_fn(n_series_succeeded) -> str.
+    """
+    series_names = sorted(mapped["series"].dropna().unique().tolist())
+    forecast_parts: list = []
+    scores: list = []
+    scores_per_series: dict = {}
+    params_per_series: dict = {}
+    all_y_true: list = []
+    all_y_pred: list = []
+
+    for s in series_names:
+        try:
+            df_series = mapped[mapped["series"] == s]
+            result = validation_fn(df_series, metric_name=primary_metric)
+            score, forecast_val = result[0], result[1]
+            if np.isfinite(score):
+                forecast_val = forecast_val.copy()
+                forecast_val["series"] = s
+                forecast_parts.append(forecast_val)
+                scores.append(score)
+                scores_per_series[s] = float(score)
+                y_actual = df_series[df_series["ds"].isin(forecast_val["ds"])]["y"].to_numpy()
+                all_y_true.extend(y_actual)
+                all_y_pred.extend(forecast_val["yhat"].to_numpy())
+                params = params_fn(*result[2:])
+                if params is not None:
+                    params_per_series[s] = params
+        except Exception as e:
+            st.warning(f"{model_name} failed for series {s}: {e}")
+            continue
+
+    if not scores:
+        return None
+
+    yt = np.array(all_y_true)
+    yp = np.array(all_y_pred)
+    return {
+        "score": float(np.mean(scores)),
+        "scores_per_series": scores_per_series,
+        "all_metrics": {m: _compute_metric(m, yt, yp) for m in METRIC_OPTIONS},
+        "validation_forecast": pd.concat(forecast_parts, ignore_index=True),
+        "best_params": params_per_series,
+        "message": message_fn(len(scores)),
+    }
 
 
 def _tune_prophet_grid_search(
@@ -1360,15 +1425,23 @@ else:
     elif st.session_state["df_mapped"] is not None:
         df_mapped = st.session_state["df_mapped"]
         series_count = df_mapped["series"].nunique()
-        min_days = df_mapped.groupby("series")["ds"].nunique().min()
+        _day_counts = df_mapped.groupby("series")["ds"].nunique()
+        min_days = int(_day_counts.min())
+        max_days = int(_day_counts.max())
+        _metric_label = "metric" if series_count == 1 else "metrics"
+        _history_str = (
+            f"{min_days} days of history"
+            if min_days == max_days
+            else f"{min_days}\u2013{max_days} days of history"
+        )
         if min_days < 180:
             st.warning(
-                f"\u26A0\uFE0F Data loaded \u2014 {series_count} metric(s) detected but only {min_days} days of history found. "
+                f"\u26A0\uFE0F Data loaded \u2014 {series_count} {_metric_label} detected with {_history_str}. "
                 "We recommend at least 180 days for reliable forecasts."
             )
         else:
             st.success(
-                f"\u2705 Data loaded successfully \u2014 {series_count} metric(s) detected with at least {min_days} days of history. "
+                f"\u2705 Data loaded successfully \u2014 {series_count} {_metric_label} detected with {_history_str}. "
                 "You're ready to forecast!"
             )
         with st.expander("Preview processed data"):
@@ -1384,7 +1457,9 @@ st.info(
     "recommended. Campaigns help the model understand "
     "sales spikes from promotions. Holidays help it "
     "account for special dates that affect buying behavior. "
-    "You can fill in one, both, or neither."
+    "You can fill in one, both, or neither.\n\n"
+    "⚠️ **These signals are only used by Prophet.** "
+    "ARIMA, ETS, Linear Regression, and XGBoost do not use campaign or holiday data."
 )
 
 tab1, tab2 = st.tabs(["\U0001F4C5 Campaign Periods", "\U0001F389 E-commerce Holidays"])
@@ -1760,8 +1835,10 @@ if df_mapped is not None and not df_mapped.empty:
         
         # Validation Logic
         st.session_state["forecast_date_error"] = None
-        if start_date <= last_data_date:
-            st.caption(f"📅 Forecast must start after your last data point ({last_data_date}).")
+        if start_date < last_data_date:
+            st.session_state["forecast_date_error"] = (
+                f"Forecast start date must be on or after your last data point ({last_data_date})."
+            )
         elif end_date <= start_date:
             st.session_state["forecast_date_error"] = "Forecast End Date must be after the Forecast Start Date."
         
@@ -1891,6 +1968,23 @@ if info["bands"]:
             + ["❌ Poor (above 35%)"]
         )
     )
+_ml_selected_pre = any(m in selected_models for m in ["Linear Regression", "XGBoost"])
+_pre_fs = st.session_state.get("forecast_start_date")
+_pre_fe = st.session_state.get("forecast_end_date")
+if (
+    _ml_selected_pre
+    and _pre_fs is not None
+    and _pre_fe is not None
+    and not st.session_state.get("forecast_date_error")
+    and (pd.to_datetime(_pre_fe) - pd.to_datetime(_pre_fs)).days > 30
+):
+    _pre_horizon = (pd.to_datetime(_pre_fe) - pd.to_datetime(_pre_fs)).days
+    st.warning(
+        f"⚠️ Your forecast horizon is {_pre_horizon} days. Linear Regression and XGBoost are most "
+        "accurate for short-term forecasts (up to 30 days) — consider switching to Prophet or ARIMA "
+        "for longer horizons, or reduce your forecast end date."
+    )
+
 st.divider()
 
 # --------------------------------------------------------------------------- 5
@@ -1978,29 +2072,31 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
                         growth_strategy="auto",
                     )
                     
-                    # Evaluate against all available metrics
+                    # Single pass: collect actuals/predictions for all metrics and per-series scores
+                    all_y_true_p: list = []
+                    all_y_pred_p: list = []
+                    scores_per_series_prophet = {}
+                    for s in mapped["series"].unique():
+                        s_mapped = mapped[mapped["series"] == s]
+                        n = len(s_mapped)
+                        vd = int(min(90, max(7, n * 0.2)))
+                        val_y = s_mapped.iloc[n - vd:]["y"].to_numpy()
+                        s_fc = validation_forecast[validation_forecast["series"] == s]
+                        if not s_fc.empty:
+                            s_pred = s_fc["yhat"].to_numpy()
+                            all_y_true_p.extend(val_y)
+                            all_y_pred_p.extend(s_pred)
+                            s_score = _compute_metric(primary_metric, val_y, s_pred)
+                            scores_per_series_prophet[s] = float(s_score) if np.isfinite(s_score) else float("inf")
+
                     all_metric_results = {}
-                    for m in METRIC_OPTIONS:
-                        # For Prophet, we currently tune based on primary_metric
-                        # To be thorough, we compute all metrics for the best model found
-                        y_true = []
-                        y_pred = []
-                        for s in mapped["series"].unique():
-                            s_mapped = mapped[mapped["series"] == s]
-                            # Simple split matching the internal prophet validation
-                            n = len(s_mapped)
-                            vd = int(min(30, max(7, n * 0.2)))
-                            val_y = s_mapped.iloc[n-vd:]["y"].to_numpy()
-                            s_fc = validation_forecast[validation_forecast["series"] == s]
-                            if not s_fc.empty:
-                                y_true.extend(val_y)
-                                y_pred.extend(s_fc["yhat"].to_numpy())
-                        
-                        if y_true and y_pred:
-                            all_metric_results[m] = _compute_metric(m, np.array(y_true), np.array(y_pred))
+                    if all_y_true_p and all_y_pred_p:
+                        for m in METRIC_OPTIONS:
+                            all_metric_results[m] = _compute_metric(m, np.array(all_y_true_p), np.array(all_y_pred_p))
 
                     model_results["Prophet"] = {
                         "score": best_score,
+                        "scores_per_series": scores_per_series_prophet,
                         "all_metrics": all_metric_results,
                         "validation_forecast": validation_forecast,
                         "best_params": best_params,
@@ -2012,223 +2108,103 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
                 completed += 1
                 progress_bar.progress(
                     completed / total_steps,
-                    text=f"Completed {completed}/{total_steps} - Last finished: Prophet",
+                    text=f"Completed {completed}/{total_steps} — Last finished: Prophet",
                 )
 
         # 2. ARIMA
         if "ARIMA" in selected_models:
             try:
                 with st.spinner("Running ARIMA (grid search p,d,q)..."):
-                    series_names = sorted(mapped["series"].dropna().unique().tolist())
-                    forecast_parts = []
-                    scores = []
-                    params_per_series = {}
-                    all_y_true = []
-                    all_y_pred = []
-                    for s in series_names:
-                        try:
-                            df_series = mapped[mapped["series"] == s]
-                            score, forecast_val, model = _fit_predict_arima_validation(
-                                df_series, metric_name=primary_metric
-                            )
-                            if np.isfinite(score):
-                                forecast_val["series"] = s
-                                forecast_parts.append(forecast_val)
-                                scores.append(score)
-                                
-                                # Collect for aggregate metrics
-                                n = len(df_series)
-                                vd = int(min(30, max(7, n * 0.2)))
-                                all_y_true.extend(df_series.iloc[n-vd:]["y"].to_numpy())
-                                all_y_pred.extend(forecast_val["yhat"].to_numpy())
-
-                                if hasattr(model, 'order'):
-                                    params_per_series[s] = {"p": model.order[0], "d": model.order[1], "q": model.order[2]}
-                        except Exception as e:
-                            st.warning(f"ARIMA failed for series {s}: {e}")
-                            continue
-
-                    if scores:
-                        avg_score = float(np.mean(scores))
-                        all_metric_results = {}
-                        for m in METRIC_OPTIONS:
-                            all_metric_results[m] = _compute_metric(m, np.array(all_y_true), np.array(all_y_pred))
-
-                        validation_forecast = pd.concat(forecast_parts, ignore_index=True)
-                        model_results["ARIMA"] = {
-                            "score": avg_score,
-                            "all_metrics": all_metric_results,
-                            "validation_forecast": validation_forecast,
-                            "best_params": params_per_series,
-                            "message": f"ARIMA grid-searched (p,d,q) across {len(scores)} series.",
-                        }
+                    result = _run_model_validation(
+                        "ARIMA",
+                        _fit_predict_arima_validation,
+                        mapped,
+                        primary_metric,
+                        lambda model: (
+                            {"p": model.order[0], "d": model.order[1], "q": model.order[2]}
+                            if hasattr(model, "order")
+                            else None
+                        ),
+                        lambda n: f"ARIMA grid-searched (p,d,q) across {n} series.",
+                    )
+                    if result:
+                        model_results["ARIMA"] = result
             except Exception as e:  # noqa: BLE001
                 st.warning(f"ARIMA training failed: {e}")
             finally:
                 completed += 1
                 progress_bar.progress(
                     completed / total_steps,
-                    text=f"Completed {completed}/{total_steps} - Last finished: ARIMA",
+                    text=f"Completed {completed}/{total_steps} — Last finished: ARIMA",
                 )
 
         # 3. ETS
         if "ETS" in selected_models:
             try:
                 with st.spinner("Running ETS (ExponentialSmoothing grid search)..."):
-                    series_names = sorted(mapped["series"].dropna().unique().tolist())
-                    forecast_parts = []
-                    scores = []
-                    params_per_series = {}
-                    all_y_true = []
-                    all_y_pred = []
-                    for s in series_names:
-                        try:
-                            df_series = mapped[mapped["series"] == s]
-                            score, forecast_val, model, params = _fit_predict_ets_validation(
-                                df_series, metric_name=primary_metric
-                            )
-                            if np.isfinite(score):
-                                forecast_val["series"] = s
-                                forecast_parts.append(forecast_val)
-                                scores.append(score)
-                                
-                                n = len(df_series)
-                                vd = int(min(30, max(7, n * 0.2)))
-                                all_y_true.extend(df_series.iloc[n-vd:]["y"].to_numpy())
-                                all_y_pred.extend(forecast_val["yhat"].to_numpy())
-
-                                params_per_series[s] = params
-                        except Exception as e:
-                            st.warning(f"ETS failed for series {s}: {e}")
-                            continue
-
-                    if scores:
-                        avg_score = float(np.mean(scores))
-                        all_metric_results = {}
-                        for m in METRIC_OPTIONS:
-                            all_metric_results[m] = _compute_metric(m, np.array(all_y_true), np.array(all_y_pred))
-
-                        validation_forecast = pd.concat(forecast_parts, ignore_index=True)
-                        model_results["ETS"] = {
-                            "score": avg_score,
-                            "all_metrics": all_metric_results,
-                            "validation_forecast": validation_forecast,
-                            "best_params": params_per_series,
-                            "message": f"ETS tuned via grid search across {len(scores)} series.",
-                        }
+                    result = _run_model_validation(
+                        "ETS",
+                        _fit_predict_ets_validation,
+                        mapped,
+                        primary_metric,
+                        lambda _, params: params,
+                        lambda n: f"ETS tuned via grid search across {n} series.",
+                    )
+                    if result:
+                        model_results["ETS"] = result
             except Exception as e:  # noqa: BLE001
                 st.warning(f"ETS training failed: {e}")
             finally:
                 completed += 1
                 progress_bar.progress(
                     completed / total_steps,
-                    text=f"Completed {completed}/{total_steps} - Last finished: ETS",
+                    text=f"Completed {completed}/{total_steps} — Last finished: ETS",
                 )
 
         # 4. Linear Regression
         if "Linear Regression" in selected_models:
             try:
                 with st.spinner("Running Linear Regression (feature engineering)..."):
-                    series_names = sorted(mapped["series"].dropna().unique().tolist())
-                    forecast_parts = []
-                    scores = []
-                    models_per_series = {}
-                    all_y_true = []
-                    all_y_pred = []
-                    for s in series_names:
-                        try:
-                            df_series = mapped[mapped["series"] == s]
-                            score, forecast_val, model = _fit_predict_lr_validation(
-                                df_series, metric_name=primary_metric
-                            )
-                            if np.isfinite(score):
-                                forecast_val["series"] = s
-                                forecast_parts.append(forecast_val)
-                                scores.append(score)
-                                models_per_series[s] = model
-                                
-                                # For LR, we need to match the indices used in train_linear_regression
-                                # Instead of complex re-splitting, we'll use the forecast_val dates
-                                y_val_actual = df_series[df_series["ds"].isin(forecast_val["ds"])]["y"].to_numpy()
-                                all_y_true.extend(y_val_actual)
-                                all_y_pred.extend(forecast_val["yhat"].to_numpy())
-                        except Exception as e:
-                            st.warning(f"Linear Regression failed for series {s}: {e}")
-                            continue
-
-                    if scores:
-                        avg_score = float(np.mean(scores))
-                        all_metric_results = {}
-                        for m in METRIC_OPTIONS:
-                            all_metric_results[m] = _compute_metric(m, np.array(all_y_true), np.array(all_y_pred))
-
-                        validation_forecast = pd.concat(forecast_parts, ignore_index=True)
-                        model_results["Linear Regression"] = {
-                            "score": avg_score,
-                            "all_metrics": all_metric_results,
-                            "validation_forecast": validation_forecast,
-                            "best_params": models_per_series,
-                            "message": f"Linear Regression trained across {len(scores)} series.",
-                        }
+                    result = _run_model_validation(
+                        "Linear Regression",
+                        _fit_predict_lr_validation,
+                        mapped,
+                        primary_metric,
+                        lambda model: model,
+                        lambda n: f"Linear Regression trained across {n} series.",
+                    )
+                    if result:
+                        model_results["Linear Regression"] = result
             except Exception as e:  # noqa: BLE001
                 st.warning(f"Linear Regression training failed: {e}")
             finally:
                 completed += 1
                 progress_bar.progress(
                     completed / total_steps,
-                    text=f"Completed {completed}/{total_steps} - Last finished: Linear Regression",
+                    text=f"Completed {completed}/{total_steps} — Last finished: Linear Regression",
                 )
 
         # 5. XGBoost
         if "XGBoost" in selected_models:
             try:
                 with st.spinner("Running XGBoost (gradient boosting)..."):
-                    series_names = sorted(mapped["series"].dropna().unique().tolist())
-                    forecast_parts = []
-                    scores = []
-                    models_per_series = {}
-                    all_y_true = []
-                    all_y_pred = []
-                    for s in series_names:
-                        try:
-                            df_series = mapped[mapped["series"] == s]
-                            score, forecast_val, model = _fit_predict_xgboost_validation(
-                                df_series, metric_name=primary_metric
-                            )
-                            if np.isfinite(score):
-                                forecast_val["series"] = s
-                                forecast_parts.append(forecast_val)
-                                scores.append(score)
-                                models_per_series[s] = model
-                                
-                                y_val_actual = df_series[df_series["ds"].isin(forecast_val["ds"])]["y"].to_numpy()
-                                all_y_true.extend(y_val_actual)
-                                all_y_pred.extend(forecast_val["yhat"].to_numpy())
-                        except Exception as e:
-                            st.warning(f"XGBoost failed for series {s}: {e}")
-                            continue
-
-                    if scores:
-                        avg_score = float(np.mean(scores))
-                        all_metric_results = {}
-                        for m in METRIC_OPTIONS:
-                            all_metric_results[m] = _compute_metric(m, np.array(all_y_true), np.array(all_y_pred))
-
-                        validation_forecast = pd.concat(forecast_parts, ignore_index=True)
-                        model_results["XGBoost"] = {
-                            "score": avg_score,
-                            "all_metrics": all_metric_results,
-                            "validation_forecast": validation_forecast,
-                            "best_params": models_per_series,
-                            "message": f"XGBoost trained across {len(scores)} series.",
-                        }
+                    result = _run_model_validation(
+                        "XGBoost",
+                        _fit_predict_xgboost_validation,
+                        mapped,
+                        primary_metric,
+                        lambda model: model,
+                        lambda n: f"XGBoost trained across {n} series.",
+                    )
+                    if result:
+                        model_results["XGBoost"] = result
             except Exception as e:  # noqa: BLE001
                 st.warning(f"XGBoost training failed: {e}")
             finally:
                 completed += 1
                 progress_bar.progress(
                     completed / total_steps,
-                    text=f"Completed {completed}/{total_steps} - Last finished: XGBoost",
+                    text=f"Completed {completed}/{total_steps} — Last finished: XGBoost",
                 )
 
         progress_bar.progress(1.0, text="All models completed \u2705")
@@ -2246,47 +2222,96 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
             }
             st.stop()
 
-        best_model_name = min(model_results, key=lambda k: model_results[k]["score"])
+        # --- Per-series model selection ---
+        all_series_for_selection = sorted(mapped["series"].dropna().unique().tolist())
 
-        best_res = model_results[best_model_name]
-        best_score = best_res["score"]
-        validation_forecast = best_res["validation_forecast"]
-        best_params = best_res["best_params"]
-        
-        # --- NEW: Retrain best model on full data & forecast future ---
-        with st.spinner(f"Retraining best model ({best_model_name}) on full data..."):
-            future_forecast = pd.DataFrame()
+        # Global best (used as fallback and for the ranking/metric display)
+        global_best_model = min(model_results, key=lambda k: model_results[k]["score"])
+        best_res = model_results[global_best_model]
+
+        # Independently pick the best model for each series
+        best_model_per_series = {}
+        for _s in all_series_for_selection:
+            _best_for_s = None
+            _best_score_for_s = float("inf")
+            for _mname, _mres in model_results.items():
+                _s_score = _mres.get("scores_per_series", {}).get(_s, float("inf"))
+                if _s_score < _best_score_for_s:
+                    _best_score_for_s = _s_score
+                    _best_for_s = _mname
+            best_model_per_series[_s] = _best_for_s if _best_for_s is not None else global_best_model
+
+        # Consolidation: collapse to a single name when all series agree
+        _unique_best = set(best_model_per_series.values())
+        best_model_name = next(iter(_unique_best)) if len(_unique_best) == 1 else global_best_model
+
+        # Build combined validation forecast from each series' own best model
+        val_parts = []
+        for _s, _mname in best_model_per_series.items():
+            _s_val = model_results[_mname].get("validation_forecast", pd.DataFrame())
+            if not _s_val.empty and "series" in _s_val.columns:
+                _s_part = _s_val[_s_val["series"] == _s].copy()
+            elif not _s_val.empty:
+                _s_part = _s_val.copy()
+                _s_part["series"] = _s
+            else:
+                _s_part = pd.DataFrame()
+            if not _s_part.empty:
+                val_parts.append(_s_part)
+        validation_forecast = pd.concat(val_parts, ignore_index=True) if val_parts else pd.DataFrame()
+
+        # --- Retrain each model on full data for its assigned series ---
+        with st.spinner("Retraining model(s) on full data..."):
+            future_parts = []
             f_start = st.session_state["forecast_start_date"]
             f_end = st.session_state["forecast_end_date"]
-            
-            if best_model_name == "Prophet":
-                campaign_periods = st.session_state.get("campaign_periods")
-                if campaign_periods is None:
-                    campaign_periods = pd.DataFrame()
-                selected_campaign_labels = st.session_state.get("selected_campaign_labels") or []
-                manual_campaigns = st.session_state.get("campaign_manual")
-                if manual_campaigns is None:
-                    manual_campaigns = pd.DataFrame()
-                
-                selected_csv_campaigns = campaign_periods[campaign_periods["label"].isin(selected_campaign_labels)]
-                combined_campaigns = pd.concat([selected_csv_campaigns, manual_campaigns], ignore_index=True)
-                campaign_days = _build_campaign_days(combined_campaigns, None)
-                
-                holidays_df = st.session_state.get("ecommerce_holidays")
-                future_forecast, _ = _fit_prophet_full(mapped, campaign_days, holidays_df, best_params, f_start, f_end)
-            elif best_model_name == "ARIMA":
-                future_forecast, _ = _fit_arima_full(mapped, best_params, f_start, f_end)
-            elif best_model_name == "ETS":
-                future_forecast, _ = _fit_ets_full(mapped, best_params, f_start, f_end)
-            elif best_model_name in ["Linear Regression", "XGBoost"]:
-                ml_horizon = (pd.to_datetime(f_end) - pd.to_datetime(f_start)).days
-                if ml_horizon > 30:
-                    st.warning(
-                        f"⚠️ {best_model_name} is most accurate for short-term forecasts (up to 30 days). "
-                        f"Your selected horizon is {ml_horizon} days — consider using Prophet or ARIMA for "
-                        f"longer forecasts, or reduce your forecast end date."
-                    )
-                future_forecast = _fit_ml_full(mapped, best_params, f_start, f_end)
+
+            # Campaign/holiday context (Prophet only, prepared once)
+            _cp_state = st.session_state.get("campaign_periods")
+            if _cp_state is None:
+                _cp_state = pd.DataFrame()
+            _cl_state = st.session_state.get("selected_campaign_labels") or []
+            _mc_state = st.session_state.get("campaign_manual")
+            if _mc_state is None:
+                _mc_state = pd.DataFrame()
+            _sel_csv = _cp_state[_cp_state["label"].isin(_cl_state)]
+            campaign_days = _build_campaign_days(pd.concat([_sel_csv, _mc_state], ignore_index=True), None)
+            holidays_df = st.session_state.get("ecommerce_holidays")
+
+            for _mname in _unique_best:
+                _series_for_model = [s for s, m in best_model_per_series.items() if m == _mname]
+                _mapped_sub = mapped[mapped["series"].isin(_series_for_model)].copy()
+                try:
+                    if _mname == "Prophet":
+                        _params = model_results["Prophet"]["best_params"]
+                        _subset_fc, _ = _fit_prophet_full(_mapped_sub, campaign_days, holidays_df, _params, f_start, f_end)
+                    elif _mname == "ARIMA":
+                        _all_p = model_results["ARIMA"]["best_params"]
+                        _subset_p = {s: _all_p[s] for s in _series_for_model if s in _all_p}
+                        _subset_fc, _ = _fit_arima_full(_mapped_sub, _subset_p, f_start, f_end)
+                    elif _mname == "ETS":
+                        _all_p = model_results["ETS"]["best_params"]
+                        _subset_p = {s: _all_p[s] for s in _series_for_model if s in _all_p}
+                        _subset_fc, _ = _fit_ets_full(_mapped_sub, _subset_p, f_start, f_end)
+                    elif _mname in ["Linear Regression", "XGBoost"]:
+                        _ml_horizon = (pd.to_datetime(f_end) - pd.to_datetime(f_start)).days
+                        if _ml_horizon > 30:
+                            st.warning(
+                                f"⚠️ {_mname} is most accurate for short-term forecasts (up to 30 days). "
+                                f"Your selected horizon is {_ml_horizon} days — consider using Prophet or ARIMA for "
+                                f"longer forecasts, or reduce your forecast end date."
+                            )
+                        _all_p = model_results[_mname]["best_params"]
+                        _subset_p = {s: _all_p[s] for s in _series_for_model if s in _all_p}
+                        _subset_fc = _fit_ml_full(_mapped_sub, _subset_p, f_start, f_end)
+                    else:
+                        _subset_fc = pd.DataFrame()
+                    if _subset_fc is not None and not _subset_fc.empty:
+                        future_parts.append(_subset_fc)
+                except Exception as _e:
+                    st.warning(f"Retraining failed for {_mname} ({', '.join(_series_for_model)}): {_e}")
+
+            future_forecast = pd.concat(future_parts, ignore_index=True) if future_parts else pd.DataFrame()
 
         series_names = sorted(
             validation_forecast["series"].dropna().unique().tolist()
@@ -2317,12 +2342,13 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
         st.session_state["forecast_run_done"] = True
         st.session_state["results_placeholder"] = {
             "best_model": best_model_name,
+            "best_model_per_series": best_model_per_series,
             "metric_scores": best_res["all_metrics"],
-            "all_model_results": model_results, # Store all results for details table
+            "all_model_results": model_results,
             "primary_metric": primary_metric,
             "series_names": series_names,
             "validation_df": validation_forecast,
-            "forecast_df": future_forecast, # This is the future forecast
+            "forecast_df": future_forecast,
             "message": msg,
         }
 
@@ -2334,74 +2360,122 @@ import plotly.graph_objects as go
 
 st.header("6. Results")
 
+with st.expander("ℹ️ Known limitations", expanded=False):
+    st.markdown(
+        """
+- **Confidence intervals are approximate** — they use bootstrapped/analytical estimates, not full simulation, so the bands may understate true uncertainty.
+- **Long-horizon accuracy degrades** — the models use recursive (iterative) prediction, meaning each step's error compounds. Forecasts beyond 30–60 days should be treated as directional, not precise.
+- **Linear Regression and XGBoost are less reliable past 30 days** — these models extrapolate from engineered lag/rolling features that grow stale over time. A dashed reliability line is shown on the chart at the 30-day mark.
+- **180-day history is recommended, not required** — shorter datasets will still run but may produce noisier models with wider error ranges.
+- **Campaigns and holidays are only used by Prophet** — ARIMA, ETS, Linear Regression, and XGBoost do not incorporate these signals.
+- **Per-series model selection** — when multiple metrics are forecast, each series independently picks its best model. A single global winner is shown only when all series agree.
+        """
+    )
+
 if not st.session_state.get("forecast_run_done"):
     st.info("Run the forecast in step 5 to see the best model, scores, and chart here.")
 else:
     res = st.session_state.get("results_placeholder") or {}
     series_names = res.get("series_names") or []
     st.subheader("Best model evaluation")
-    
-    # Primary Metric
+
     primary_m = res.get("primary_metric") or "MAPE"
     primary_val = (res.get("metric_scores") or {}).get(primary_m, 0)
-    
-    c1, c2 = st.columns(2)
-    with c1:
-        st.metric(label="Selected model", value=res.get("best_model") or "-")
-    with c2:
-        st.metric(label=f"📈 {METRIC_DISPLAY_NAMES.get(primary_m, primary_m)}", value=f"{primary_val:.4g}")
+    best_per_series = res.get("best_model_per_series") or {}
+    all_model_results = res.get("all_model_results") or {}
+    _df_mapped = st.session_state.get("df_mapped")
 
-    score = primary_val
-    if primary_m == "MAPE":
-        if score < 0.10:
-            st.success(f"✅ Excellent — model is off by {score:.1%} on average.")
-        elif score < 0.20:
-            st.success(f"✅ Good — {score:.1%} average error, acceptable for most use cases.")
-        elif score < 0.35:
-            st.warning(f"⚠️ Fair — {score:.1%} average error. Consider adding more history.")
-        else:
-            st.error(f"❌ Poor — {score:.1%} average error. Forecast may not be reliable.")
-    else:
-        st.info(
-            f"**{primary_m} = {score:,.2f}** — measured in the same unit as your data. "
-            "Compare across models to find the best performer."
-        )
+    if len(best_per_series) <= 1:
+        # Single series — simple two-metric display
+        c1, c2 = st.columns(2)
+        with c1:
+            st.metric(label="Selected model", value=res.get("best_model") or "-")
+        with c2:
+            st.metric(label=f"📈 {METRIC_DISPLAY_NAMES.get(primary_m, primary_m)}", value=f"{primary_val:.4g}")
 
-    all_models = res.get("all_model_results", {})
-    best_model_name = res.get("best_model", "").replace(" (Best Available)", "")
-
-    if all_models and len(all_models) > 1:
-        model_scores = {
-            name: info.get("all_metrics", {}).get(primary_m, float("inf"))
-            for name, info in all_models.items()
-            if primary_m in info.get("all_metrics", {})
-        }
-
-        model_scores = {
-            name: score
-            for name, score in model_scores.items()
-            if np.isfinite(score)
-        }
-
-        if len(model_scores) > 1 and best_model_name in model_scores:
-            best_score = model_scores[best_model_name]
-            sorted_models = sorted(model_scores.items(), key=lambda x: x[1])
-
-            unique_scores = {score for _, score in sorted_models}
-            if len(unique_scores) == 1:
-                st.info(f"All models performed equally on {primary_m}.")
+        score = primary_val
+        if primary_m == "MAPE":
+            if score < 0.10:
+                st.success(f"✅ Excellent — model is off by {score:.1%} on average.")
+            elif score < 0.20:
+                st.success(f"✅ Good — {score:.1%} average error, acceptable for most use cases.")
+            elif score < 0.35:
+                st.warning(f"⚠️ Fair — {score:.1%} average error. Consider adding more history.")
             else:
-                runner_up = [(name, score) for name, score in sorted_models if name != best_model_name]
+                st.error(f"❌ Poor — {score:.1%} average error. Forecast may not be reliable.")
+        else:
+            st.info(
+                f"**{primary_m} = {score:,.2f}** — measured in the same unit as your data; lower is better."
+            )
+    else:
+        # Multiple series — one card per series with its own individually computed score
+        cols = st.columns(len(best_per_series))
+        for i, (series_name, model_name) in enumerate(best_per_series.items()):
+            model_info = all_model_results.get(model_name, {})
+            val_df = model_info.get("validation_forecast", pd.DataFrame())
 
-                if runner_up:
-                    runner_name, runner_score = runner_up[0]
-                    if runner_score > 0 and np.isfinite(runner_score):
-                        improvement = ((runner_score - best_score) / runner_score) * 100
-                        st.info(
-                            f"🏆 **{best_model_name}** is the best performer — **{improvement:.0f}% more "
-                            f"accurate** than the runner-up ({runner_name}) based on {primary_m}."
-                        )
-            with st.expander("See full model ranking", expanded=False):
+            series_score = None
+            if not val_df.empty and "series" in val_df.columns and _df_mapped is not None:
+                s_val = val_df[val_df["series"] == series_name]
+                s_mapped = _df_mapped[_df_mapped["series"] == series_name]
+                if not s_val.empty and not s_mapped.empty:
+                    s_actual = s_mapped[s_mapped["ds"].isin(s_val["ds"])]["y"].to_numpy()
+                    s_pred = s_val["yhat"].to_numpy()
+                    if len(s_actual) > 0 and len(s_pred) > 0:
+                        min_len = min(len(s_actual), len(s_pred))
+                        series_score = _compute_metric(primary_m, s_actual[:min_len], s_pred[:min_len])
+
+            with cols[i]:
+                st.markdown(f"**{series_name}**")
+                st.metric(label="Best model", value=model_name)
+                if series_score is not None:
+                    score_display = (
+                        f"{series_score:.1%}" if primary_m == "MAPE" else f"{series_score:,.2f}"
+                    )
+                    st.metric(label=primary_m, value=score_display)
+                    if primary_m == "MAPE":
+                        if series_score < 0.10:
+                            st.success(f"✅ Excellent ({series_score:.1%})")
+                        elif series_score < 0.20:
+                            st.success(f"✅ Good ({series_score:.1%})")
+                        elif series_score < 0.35:
+                            st.warning(f"⚠️ Fair ({series_score:.1%})")
+                        else:
+                            st.error(f"❌ Poor ({series_score:.1%})")
+                else:
+                    st.caption("Score unavailable")
+
+    if all_model_results and len(all_model_results) > 1 and best_per_series:
+        with st.expander("See full model ranking", expanded=False):
+            for series_name in best_per_series.keys():
+                st.markdown(f"**{series_name}**")
+
+                series_scores: dict = {}
+                for _mn, _mi in all_model_results.items():
+                    _vdf = _mi.get("validation_forecast", pd.DataFrame())
+                    if _vdf.empty or "series" not in _vdf.columns:
+                        continue
+                    _sv = _vdf[_vdf["series"] == series_name]
+                    if _df_mapped is None or _sv.empty:
+                        continue
+                    _sm = _df_mapped[_df_mapped["series"] == series_name]
+                    if _sm.empty:
+                        continue
+                    _sa = _sm[_sm["ds"].isin(_sv["ds"])]["y"].to_numpy()
+                    _sp = _sv["yhat"].to_numpy()
+                    if len(_sa) > 0 and len(_sp) > 0:
+                        _ml = min(len(_sa), len(_sp))
+                        _sc = _compute_metric(primary_m, _sa[:_ml], _sp[:_ml])
+                        if np.isfinite(_sc):
+                            series_scores[_mn] = _sc
+
+                if not series_scores:
+                    st.caption("No valid scores available for this series.")
+                    continue
+
+                sorted_series_models = sorted(series_scores.items(), key=lambda x: x[1])
+                best_series_score = sorted_series_models[0][1]
+
                 col_rank, col_name, col_score, col_diff = st.columns([0.5, 2, 1.5, 1.5])
                 with col_rank:
                     st.markdown("**#**")
@@ -2411,42 +2485,39 @@ else:
                     st.markdown(f"**{primary_m} Score**")
                 with col_diff:
                     st.markdown("**vs Best**")
-
                 st.divider()
 
-                for rank, (name, score) in enumerate(sorted_models, 1):
-                    if not np.isfinite(score):
-                        continue
-
+                for rank, (mdl_name, mdl_score) in enumerate(sorted_series_models, 1):
                     medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, f"{rank}.")
-
-                    if name == best_model_name:
-                        diff_str = "← best"
-                        diff_color = "green"
+                    is_winner = mdl_name == best_per_series.get(series_name)
+                    if mdl_score == best_series_score:
+                        diff_str, diff_color = "← best", "green"
                     else:
-                        if unique_scores and len(unique_scores) == 1:
-                            diff_str = "← tied"
-                        elif best_score > 0 and np.isfinite(best_score):
-                            pct_worse = ((score - best_score) / best_score) * 100
-                            diff_str = f"+{pct_worse:.0f}% worse"
-                        else:
-                            diff_str = "worse"
-                        diff_color = "red"
+                        pct_worse = ((mdl_score - best_series_score) / best_series_score) * 100
+                        diff_str, diff_color = f"+{pct_worse:.0f}% worse", "red"
 
                     col_rank, col_name, col_score, col_diff = st.columns([0.5, 2, 1.5, 1.5])
                     with col_rank:
                         st.write(medal)
                     with col_name:
-                        st.write(f"**{name}**" if name == best_model_name else name)
+                        st.write(f"**{mdl_name}**" if is_winner else mdl_name)
                     with col_score:
-                        if primary_m == "MAPE":
-                            st.write(f"{score:.1%}")
-                        else:
-                            st.write(f"{score:,.2f} {primary_m}")
+                        st.write(f"{mdl_score:.1%}" if primary_m == "MAPE" else f"{mdl_score:,.2f}")
                     with col_diff:
                         st.markdown(f":{diff_color}[{diff_str}]")
-        elif len(model_scores) <= 1:
-            st.info("Run more models to compare.")
+
+                if len(sorted_series_models) > 1:
+                    best_name, best_score_val = sorted_series_models[0]
+                    runner_name, runner_score = sorted_series_models[1]
+                    if runner_score > 0:
+                        improvement = ((runner_score - best_score_val) / runner_score) * 100
+                        st.caption(
+                            f"🏆 {best_name} is {improvement:.0f}% more accurate than {runner_name} for {series_name}."
+                        )
+
+                st.markdown("---")
+    elif all_model_results and len(all_model_results) <= 1:
+        st.info("Run more models to compare.")
 
     df_val = res.get("validation_df")
     df_future = res.get("forecast_df")
@@ -2485,10 +2556,15 @@ else:
         st.warning(res["message"])
 
     best_model_name = (res.get("best_model") or "").replace(" (Best Available)", "")
+    _bm_ps_warn = res.get("best_model_per_series") or {}
+    _uses_ml = (
+        best_model_name in ["Linear Regression", "XGBoost"]
+        or any(m in ["Linear Regression", "XGBoost"] for m in _bm_ps_warn.values())
+    )
     forecast_start_date = st.session_state.get("forecast_start_date")
     forecast_end_date = st.session_state.get("forecast_end_date")
     if (
-        best_model_name in ["Linear Regression", "XGBoost"]
+        _uses_ml
         and forecast_start_date is not None
         and forecast_end_date is not None
         and (pd.to_datetime(forecast_end_date) - pd.to_datetime(forecast_start_date)).days > 30
@@ -2752,9 +2828,11 @@ else:
                     
                     # Calculate Error
                     table_df["Error"] = table_df["Actual"] - table_df["Forecast"]
-                    table_df["Error %"] = (table_df["Error"] / table_df["Actual"]).abs() * 100
+                    table_df["Error %"] = (table_df["Error"] / table_df["Actual"].replace(0, np.nan)).abs() * 100
 
                     def get_status(error_pct):
+                        if pd.isna(error_pct):
+                            return ""
                         if error_pct <= 10:
                             return "✅ Good"
                         if error_pct <= 20:
@@ -2762,15 +2840,18 @@ else:
                         return "❌ High"
 
                     table_df["Status"] = table_df["Error %"].apply(get_status)
-                    
+
                     st.markdown("### Validation Data (Actual vs Predicted)")
                     st.dataframe(
-                        table_df.style.format({
-                            "Actual": "{:,.2f}",
-                            "Forecast": "{:,.2f}",
-                            "Error": "{:,.2f}",
-                            "Error %": "{:.2f}%"
-                        }),
+                        table_df.style.format(
+                            {
+                                "Actual": "{:,.2f}",
+                                "Forecast": "{:,.2f}",
+                                "Error": "{:,.2f}",
+                                "Error %": "{:.2f}%",
+                            },
+                            na_rep="-",
+                        ),
                         use_container_width=True,
                         hide_index=True
                     )
