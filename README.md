@@ -1,6 +1,6 @@
 # 📈 Forecast App
 
-An end-to-end, self-service forecasting platform built with Streamlit. Upload your data, configure campaigns and holidays, and let the app automatically train, tune, and compare **5 forecasting models** to find the best fit for your data.
+An end-to-end, self-service forecasting platform built with Streamlit. Upload your data, configure campaigns and holidays, and let the app automatically train, tune, and compare **6 forecasting models** to find the best fit for your data.
 
 ---
 
@@ -9,11 +9,12 @@ An end-to-end, self-service forecasting platform built with Streamlit. Upload yo
 - **Flexible data input** — upload CSV or XLSX files directly in the browser
 - **Multi-series forecasting** — forecast multiple metrics (e.g. products, regions) at once
 - **Campaign & holiday awareness** — Prophet uses campaign windows and e-commerce holidays as regressors; other models do not use these inputs
-- **5 models compared automatically**:
+- **6 models compared automatically**:
   | Model | Best for |
   |---|---|
   | Prophet | Strong seasonal patterns, holidays, campaigns |
-  | ARIMA (auto-tuned) | Stable series, statistical baseline |
+  | ARIMA (auto-tuned) | Stable trends without strong seasonality |
+  | SARIMA (auto-tuned) | Data with repeating seasonal cycles (weekly, monthly) |
   | ETS | Weighted recent history, robust fallback |
   | Linear Regression | Interpretable, feature-based |
   | XGBoost | Complex non-linear patterns |
@@ -74,7 +75,7 @@ Christmas,2024-12-25
 The app follows a simple step-by-step workflow:
 
 1. **Data source** — Upload a CSV or XLSX file
-2. **Data preview & schema mapping** — Preview your uploaded data, then tell the app which column is the date and which column(s) to forecast
+2. **Data preview & schema mapping** — Preview your uploaded data, then tell the app which column is the date and which column(s) to forecast; duplicate dates are detected here and must be resolved before continuing
 3. **Seasonality & holidays** — Select campaigns and holidays relevant to your data (used by Prophet only)
 4. **Model selection & evaluation settings** — Choose which models to run, your accuracy metric, and forecast date range
 5. **Run forecast** — The app trains, tunes, and compares all selected models
@@ -85,6 +86,7 @@ The app follows a simple step-by-step workflow:
 ## 📊 Data Requirements
 
 - At least one **date column** and one **numeric metric column** (the app will flag an error if no numeric columns are detected on upload)
+- **No duplicate dates** — if your data contains multiple rows for the same date, the app detects this after schema mapping and lets you choose how to resolve it: sum the values, average them, or keep the latest entry
 - **Minimum 45 days** of history for Linear Regression / XGBoost to run
 - **180+ days recommended** for reliable forecasts across all models
 
@@ -94,7 +96,7 @@ The app follows a simple step-by-step workflow:
 
 - [Streamlit](https://streamlit.io/) — UI framework
 - [Prophet](https://facebook.github.io/prophet/) — time series forecasting
-- [pmdarima](https://alkaline-ml.com/pmdarima/) — auto ARIMA
+- [pmdarima](https://alkaline-ml.com/pmdarima/) — auto ARIMA and SARIMA
 - [statsmodels](https://www.statsmodels.org/) — ETS / Exponential Smoothing
 - [scikit-learn](https://scikit-learn.org/) — Linear Regression
 - [XGBoost](https://xgboost.readthedocs.io/) — gradient boosting
@@ -107,7 +109,8 @@ The app follows a simple step-by-step workflow:
 - **Linear Regression and XGBoost are less reliable past 30 days** — lag and rolling features go stale over time; a dashed reliability line marks the 30-day point on the chart
 - **Confidence intervals are approximate** — they use bootstrapped/analytical estimates rather than full simulation, so bands may understate true uncertainty
 - **180-day history is recommended, not required** — shorter datasets will still run but may produce noisier models
-- **Campaigns and holidays only affect Prophet** — ARIMA, ETS, Linear Regression, and XGBoost do not use these inputs
+- **Campaigns and holidays only affect Prophet** — ARIMA, SARIMA, ETS, Linear Regression, and XGBoost do not use these inputs
+- **SARIMA is slower than ARIMA** — the seasonal parameter search significantly increases training time; on large datasets or many series it can add 1–2 minutes
 - **Per-series model selection** — when forecasting multiple metrics, each series independently picks its best model; a single global winner is shown only when all series agree
 
 ---
