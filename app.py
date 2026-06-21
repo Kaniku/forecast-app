@@ -16,7 +16,7 @@ import streamlit as st
 
 # --- Constants -----------------------------------------------------------------
 
-MODEL_OPTIONS = ["Prophet", "ARIMA", "ETS", "Linear Regression", "XGBoost"]
+MODEL_OPTIONS = ["Prophet", "ARIMA", "SARIMA", "ETS", "Linear Regression", "XGBoost"]
 METRIC_OPTIONS = ["MAPE", "MAE", "RMSE", "MSE"]
 
 
@@ -50,6 +50,8 @@ def _init_session_state() -> None:
         "bq_authenticated": False,
         "campaign_manual_list": [],
         "holiday_manual_list": [],
+        "_dedup_count": 0,
+        "_df_pre_dedup": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -428,6 +430,66 @@ def _fit_predict_arima_validation(
     forecast_val["yhat"] = forecast_val["yhat"].clip(lower=0)
     forecast_val["yhat_lower"] = forecast_val["yhat_lower"].clip(lower=0)
     forecast_val["yhat_upper"] = forecast_val["yhat_upper"].clip(lower=0)
+
+    return metric, forecast_val, model
+
+
+def _fit_predict_sarima_validation(
+    df_series: pd.DataFrame,
+    *,
+    metric_name: str,
+) -> tuple[float, pd.DataFrame, Any]:
+    """Fit SARIMA(p,d,q)(P,D,Q,7) on train portion and return validation forecast."""
+    df_series = df_series.sort_values("ds").reset_index(drop=True).copy()
+    df_series["ds"] = pd.to_datetime(df_series["ds"], errors="coerce").dt.normalize()
+    df_series["y"] = pd.to_numeric(df_series["y"], errors="coerce").astype(float).clip(lower=0)
+    df_series = df_series.dropna(subset=["ds", "y"])
+    if df_series.empty:
+        return float("inf"), pd.DataFrame(), None
+
+    n = len(df_series)
+    validation_days = int(min(90, max(7, n * 0.2)))
+    validation_days = max(1, validation_days)
+    if n <= validation_days + 2:
+        return float("inf"), pd.DataFrame(), None
+
+    train_y = df_series.iloc[: n - validation_days]["y"].to_numpy()
+    val_y = df_series.iloc[n - validation_days :]["y"].to_numpy()
+    val_ds = df_series.iloc[n - validation_days :]["ds"].to_numpy()
+
+    try:
+        import pmdarima as pm  # type: ignore
+    except ImportError as e:
+        raise RuntimeError("pmdarima is not installed. Run `pip install pmdarima`.") from e
+
+    try:
+        model = pm.auto_arima(
+            train_y,
+            start_p=0, max_p=3,
+            start_q=0, max_q=3,
+            d=None,
+            seasonal=True,
+            m=7,
+            start_P=0, max_P=2,
+            start_Q=0, max_Q=2,
+            D=None,
+            stepwise=True,
+            information_criterion="aic",
+            suppress_warnings=True,
+            error_action="ignore",
+        )
+
+        forecast_y, conf_int = model.predict(n_periods=validation_days, return_conf_int=True)
+        metric = _compute_metric(metric_name, val_y, forecast_y)
+
+        forecast_val = pd.DataFrame({
+            "ds": val_ds,
+            "yhat": np.clip(forecast_y, 0, None),
+            "yhat_lower": np.clip(conf_int[:, 0], 0, None),
+            "yhat_upper": np.clip(conf_int[:, 1], 0, None),
+        })
+    except Exception:
+        return float("inf"), pd.DataFrame(), None
 
     return metric, forecast_val, model
 
@@ -1078,6 +1140,71 @@ def _fit_arima_full(
     return full_forecast, trained_models
 
 
+def _fit_sarima_full(
+    df_mapped: pd.DataFrame,
+    best_params_per_series: dict[str, dict],
+    forecast_start_date: Any,
+    forecast_end_date: Any,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Fit SARIMA on full data per series using saved (p,d,q)(P,D,Q,m) params and forecast future."""
+    import pmdarima as pm  # type: ignore
+
+    series_names = sorted(df_mapped["series"].dropna().unique().tolist())
+    forecast_parts = []
+    trained_models: dict[str, Any] = {}
+
+    last_data_date = pd.to_datetime(df_mapped["ds"]).max()
+    forecast_horizon = (pd.to_datetime(forecast_end_date) - last_data_date).days
+    forecast_horizon = max(1, forecast_horizon)
+
+    for s in series_names:
+        df_series = df_mapped[df_mapped["series"] == s].sort_values("ds").reset_index(drop=True)
+        y = df_series["y"].to_numpy()
+        params = best_params_per_series.get(s, {"p": 1, "d": 1, "q": 0, "P": 1, "D": 1, "Q": 0, "m": 7})
+
+        order = (params.get("p", 1), params.get("d", 1), params.get("q", 0))
+        seasonal_order = (params.get("P", 1), params.get("D", 1), params.get("Q", 0), params.get("m", 7))
+
+        try:
+            model = pm.ARIMA(order=order, seasonal_order=seasonal_order, suppress_warnings=True)
+            model.fit(y)
+            trained_models[s] = model
+            forecast_y, conf_int = model.predict(n_periods=forecast_horizon, return_conf_int=True)
+        except Exception:
+            try:
+                model = pm.ARIMA(order=(1, 1, 1), seasonal_order=(1, 1, 0, 7), suppress_warnings=True)
+                model.fit(y)
+                trained_models[s] = model
+                forecast_y, conf_int = model.predict(n_periods=forecast_horizon, return_conf_int=True)
+            except Exception:
+                continue
+
+        future_dates = pd.date_range(
+            start=last_data_date + pd.Timedelta(days=1),
+            periods=forecast_horizon,
+            freq="D",
+        )
+
+        forecast_df = pd.DataFrame({
+            "ds": future_dates,
+            "series": s,
+            "yhat": np.clip(forecast_y, 0, None),
+            "yhat_lower": np.clip(conf_int[:, 0], 0, None),
+            "yhat_upper": np.clip(conf_int[:, 1], 0, None),
+        })
+
+        start_ts = pd.to_datetime(forecast_start_date)
+        end_ts = pd.to_datetime(forecast_end_date)
+        forecast_parts.append(
+            forecast_df[(forecast_df["ds"] >= start_ts) & (forecast_df["ds"] <= end_ts)].copy()
+        )
+
+    if not forecast_parts:
+        return pd.DataFrame(columns=["ds", "series", "yhat", "yhat_lower", "yhat_upper"]), trained_models
+
+    return pd.concat(forecast_parts, ignore_index=True), trained_models
+
+
 def _fit_ets_full(
     df_mapped: pd.DataFrame,
     best_params_per_series: dict[str, dict[str, Any]],
@@ -1388,6 +1515,9 @@ else:
         st.session_state["date_col"] = date_pick
         st.session_state["metric_cols"] = metric_pick
         st.session_state["metric_col"] = metric_pick[0] if metric_pick else None
+        # Clear any previous dedup state from a prior run
+        st.session_state["_dedup_count"] = 0
+        st.session_state["_df_pre_dedup"] = None
         try:
             if not metric_pick:
                 st.session_state["schema_error"] = "Select at least one metric column."
@@ -1395,7 +1525,7 @@ else:
             else:
                 wide = df_raw[[date_pick, *metric_pick]].copy()
                 wide = wide.rename(columns={date_pick: "ds"})
-                
+
                 # Use a temporary value name to avoid collision if any column is already named 'y'
                 # or if the user selected multiple metrics that were renamed to 'y' previously.
                 # We'll melt with original names to keep the 'series' column descriptive.
@@ -1406,7 +1536,7 @@ else:
                     value_name="_y_value_tmp",
                 )
                 slim = slim.rename(columns={"_y_value_tmp": "y"})
-                
+
                 slim = _normalize_ds_to_calendar_date(slim)
                 slim = slim.sort_values(["series", "ds"]).reset_index(drop=True)
                 ok, msg = _validate_mapped_df(slim)
@@ -1414,11 +1544,55 @@ else:
                     st.session_state["schema_error"] = msg
                     st.session_state["df_mapped"] = None
                 else:
-                    st.session_state["df_mapped"] = slim
-                    st.session_state["schema_error"] = None
+                    # Check for duplicate dates per series
+                    _dup_sizes = slim.groupby(["series", "ds"]).size()
+                    _dup_date_count = int((_dup_sizes > 1).sum())
+                    if _dup_date_count > 0:
+                        st.session_state["_dedup_count"] = _dup_date_count
+                        st.session_state["_df_pre_dedup"] = slim
+                        st.session_state["df_mapped"] = None
+                        st.session_state["schema_error"] = None
+                    else:
+                        st.session_state["df_mapped"] = slim
+                        st.session_state["schema_error"] = None
         except KeyError as e:
             st.session_state["schema_error"] = f"Column missing: {e}"
             st.session_state["df_mapped"] = None
+
+    # --- Duplicate date resolution ---
+    _dedup_count = st.session_state.get("_dedup_count", 0)
+    _df_pre_dedup = st.session_state.get("_df_pre_dedup")
+    if _dedup_count > 0 and _df_pre_dedup is not None:
+        _date_label = "date" if _dedup_count == 1 else "dates"
+        st.warning(
+            f"⚠️ **{_dedup_count} duplicate {_date_label} found** — the same date appears more than once "
+            f"for the same metric. Choose how to resolve them before continuing:"
+        )
+        _dedup_method = st.selectbox(
+            "How should duplicate dates be resolved?",
+            options=["Sum", "Average", "Keep last"],
+            index=0,
+            key="dedup_method_select",
+            help=(
+                "**Sum:** add values together — correct when a day's data was split across multiple rows "
+                "(e.g. orders from two systems). "
+                "**Average:** take the mean — correct when a metric was recorded twice by mistake. "
+                "**Keep last:** use the final entry for each date — correct when a row was later corrected/overwritten."
+            ),
+        )
+        if st.button("Resolve duplicates & continue", type="primary", key="btn_resolve_dedup"):
+            _slim = _df_pre_dedup.copy()
+            if _dedup_method == "Sum":
+                _slim = _slim.groupby(["series", "ds"], as_index=False)["y"].sum()
+            elif _dedup_method == "Average":
+                _slim = _slim.groupby(["series", "ds"], as_index=False)["y"].mean()
+            else:  # Keep last
+                _slim = _slim.groupby(["series", "ds"], as_index=False)["y"].last()
+            _slim = _slim.sort_values(["series", "ds"]).reset_index(drop=True)
+            st.session_state["df_mapped"] = _slim
+            st.session_state["_dedup_count"] = 0
+            st.session_state["_df_pre_dedup"] = None
+            st.rerun()
 
     if st.session_state["schema_error"]:
         st.error(_friendly_ui_error(st.session_state["schema_error"]))
@@ -1459,7 +1633,7 @@ st.info(
     "account for special dates that affect buying behavior. "
     "You can fill in one, both, or neither.\n\n"
     "⚠️ **These signals are only used by Prophet.** "
-    "ARIMA, ETS, Linear Regression, and XGBoost do not use campaign or holiday data."
+    "ARIMA, SARIMA, ETS, Linear Regression, and XGBoost do not use campaign or holiday data."
 )
 
 tab1, tab2 = st.tabs(["\U0001F4C5 Campaign Periods", "\U0001F389 E-commerce Holidays"])
@@ -1866,11 +2040,12 @@ for m in MODEL_OPTIONS:
         st.session_state[f"model_chk_{m}"] = True
 
 MODEL_SHORT_DESC = {
-    "Prophet": "Seasonal + campaigns",
-    "ARIMA": "Statistical baseline",
-    "ETS": "Weighted recent history",
-    "Linear Regression": "Interpretable, 45+ days",
-    "XGBoost": "Complex patterns",
+    "Prophet": "Best for seasonal data with holidays & campaigns",
+    "ARIMA": "Best for stable trends without strong seasonality",
+    "SARIMA": "Best for data with repeating seasonal cycles",
+    "ETS": "Best for data where recent values matter most",
+    "Linear Regression": "Best for simple, steady growth patterns",
+    "XGBoost": "Best for complex data with many influencing factors",
 }
 
 selected_count = sum(
@@ -1914,11 +2089,12 @@ if not selected_models:
 
 with st.expander("What do these models mean? \U0001F4A1"):
     st.markdown(
-        "- Prophet: Best for data with strong weekly or seasonal patterns. Handles holidays and campaigns natively.\n"
-        "- ARIMA: Good for stable time series without strong seasonality. Works purely from past values.\n"
-        "- ETS: Similar to ARIMA but focuses on weighted averages - gives more importance to recent data.\n"
-        "- Linear Regression: Uses time-based features like day of week and recent values to find patterns. Needs 45+ days.\n"
-        "- XGBoost: Most powerful for complex patterns. Same features as Linear Regression but uses hundreds of decision trees."
+        "- **Prophet:** Best for data with strong weekly or seasonal patterns. Handles holidays and campaigns natively.\n"
+        "- **ARIMA:** Good for stable time series without strong seasonality. Works purely from past values and trends.\n"
+        "- **SARIMA:** Like ARIMA but also models repeating seasonal cycles (e.g. higher sales every Friday). Slower to train.\n"
+        "- **ETS:** Focuses on weighted averages — gives more importance to recent data, less to older history.\n"
+        "- **Linear Regression:** Uses time-based features like day of week and recent values to find patterns. Needs 45+ days.\n"
+        "- **XGBoost:** Most powerful for complex patterns. Same features as Linear Regression but uses hundreds of decision trees."
     )
 
 st.session_state["selected_metric"] = st.selectbox(
@@ -1928,45 +2104,20 @@ st.session_state["selected_metric"] = st.selectbox(
     key="select_metric",
     format_func=lambda metric: METRIC_DISPLAY_NAMES.get(metric, metric),
 )
-
-METRIC_INFO = {
-    "MAPE": {
-        "name": "Mean Absolute Percentage Error",
-        "explain": "Measures average % error. Easy to interpret across different data scales.",
-        "bands": [
-            (0.10, "✅ Excellent", "Model is off by less than 10% on average."),
-            (0.20, "✅ Good", "Acceptable for most forecasting use cases."),
-            (0.35, "⚠️ Fair", "Consider adding more history or adjusting campaigns."),
-            (float("inf"), "❌ Poor", "Forecast may not be reliable. Check your data quality."),
-        ],
-    },
-    "MAE": {
-        "name": "Mean Absolute Error",
-        "explain": "Average error in the same unit as your data (e.g. if forecasting sales in IDR, MAE is in IDR).",
-        "bands": None,
-    },
-    "RMSE": {
-        "name": "Root Mean Squared Error",
-        "explain": "Like MAE but penalises large errors more heavily. Same unit as your data.",
-        "bands": None,
-    },
-    "MSE": {
-        "name": "Mean Squared Error",
-        "explain": "Squared unit — best used for comparing models, not for interpreting the actual error size.",
-        "bands": None,
-    },
-}
-
-m = st.session_state["selected_metric"]
-info = METRIC_INFO[m]
-st.caption(f"**{info['name']}** — {info['explain']}")
-if info["bands"]:
+with st.expander("Which metric should I use?"):
+    st.markdown(
+        "**MAPE** — Average % error. Easy to compare across datasets. Avoid if data contains values near zero.\n\n"
+        "**MAE** — Average absolute error, in the same unit as your data. Good all-rounder.\n\n"
+        "**RMSE** — Like MAE but penalises large errors more. Use when big misses matter.\n\n"
+        "**MSE** — Squared errors. Use when you want to heavily penalise outliers."
+    )
+    st.markdown("**MAPE score guide:**")
     st.caption(
-        "Score guide: "
-        + " · ".join(
-            [f"{label} (< {int(b * 100)}%)" for b, label, _ in info["bands"][:-1]]
-            + ["❌ Poor (above 35%)"]
-        )
+        "✅ Excellent (< 10%) · ✅ Good (< 20%) · ⚠️ Fair (< 35%) · ❌ Poor (above 35%)"
+    )
+    st.caption(
+        "Note: If your data contains percentage values or numbers near zero, use MAE or RMSE"
+        " — small denominators can inflate MAPE scores."
     )
 _ml_selected_pre = any(m in selected_models for m in ["Linear Regression", "XGBoost"])
 _pre_fs = st.session_state.get("forecast_start_date")
@@ -1990,7 +2141,7 @@ st.divider()
 # --------------------------------------------------------------------------- 5
 st.header("5. Run forecast")
 st.markdown("We'll train each selected model, compare their accuracy, and automatically pick the best one for your data.")
-st.caption("\u23F1 Estimated run time: Prophet + XGBoost may take 2-5 minutes on large datasets or many series. ARIMA, ETS, and Linear Regression are typically faster.")
+st.caption("\u23F1 Estimated run time: Prophet + XGBoost may take 2\u20135 minutes on large datasets or many series. SARIMA is slower than ARIMA due to its larger search space. ARIMA, ETS, and Linear Regression are typically faster.")
 
 run_disabled = (
     st.session_state["df_mapped"] is None
@@ -2207,7 +2358,39 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
                     text=f"Completed {completed}/{total_steps} — Last finished: XGBoost",
                 )
 
-        progress_bar.progress(1.0, text="All models completed \u2705")
+        
+        # 6. SARIMA
+        if "SARIMA" in selected_models:
+            try:
+                with st.spinner("Running SARIMA (seasonal ARIMA, m=7)..."):
+                    result = _run_model_validation(
+                        "SARIMA",
+                        _fit_predict_sarima_validation,
+                        mapped,
+                        primary_metric,
+                        lambda model: (
+                            {
+                                "p": model.order[0], "d": model.order[1], "q": model.order[2],
+                                "P": model.seasonal_order[0], "D": model.seasonal_order[1],
+                                "Q": model.seasonal_order[2], "m": model.seasonal_order[3],
+                            }
+                            if hasattr(model, "order") and hasattr(model, "seasonal_order")
+                            else None
+                        ),
+                        lambda n: f"SARIMA (m=7) auto-tuned (p,d,q)(P,D,Q) across {n} series.",
+                    )
+                    if result:
+                        model_results["SARIMA"] = result
+            except Exception as e:  # noqa: BLE001
+                st.warning(f"SARIMA training failed: {e}")
+            finally:
+                completed += 1
+                progress_bar.progress(
+                    completed / total_steps,
+                    text=f"Completed {completed}/{total_steps} — Last finished: SARIMA",
+                )
+
+                progress_bar.progress(1.0, text="All models completed \u2705")
 
         # Check if we have any results
         if not model_results:
@@ -2293,6 +2476,10 @@ if st.button("Run forecast", type="primary", disabled=run_disabled, key="btn_run
                         _all_p = model_results["ETS"]["best_params"]
                         _subset_p = {s: _all_p[s] for s in _series_for_model if s in _all_p}
                         _subset_fc, _ = _fit_ets_full(_mapped_sub, _subset_p, f_start, f_end)
+                    elif _mname == "SARIMA":
+                        _all_p = model_results["SARIMA"]["best_params"]
+                        _subset_p = {s: _all_p[s] for s in _series_for_model if s in _all_p}
+                        _subset_fc, _ = _fit_sarima_full(_mapped_sub, _subset_p, f_start, f_end)
                     elif _mname in ["Linear Regression", "XGBoost"]:
                         _ml_horizon = (pd.to_datetime(f_end) - pd.to_datetime(f_start)).days
                         if _ml_horizon > 30:
@@ -2367,7 +2554,8 @@ with st.expander("ℹ️ Known limitations", expanded=False):
 - **Long-horizon accuracy degrades** — the models use recursive (iterative) prediction, meaning each step's error compounds. Forecasts beyond 30–60 days should be treated as directional, not precise.
 - **Linear Regression and XGBoost are less reliable past 30 days** — these models extrapolate from engineered lag/rolling features that grow stale over time. A dashed reliability line is shown on the chart at the 30-day mark.
 - **180-day history is recommended, not required** — shorter datasets will still run but may produce noisier models with wider error ranges.
-- **Campaigns and holidays are only used by Prophet** — ARIMA, ETS, Linear Regression, and XGBoost do not incorporate these signals.
+- **Campaigns and holidays are only used by Prophet** — ARIMA, SARIMA, ETS, Linear Regression, and XGBoost do not incorporate these signals.
+- **SARIMA is slower and needs enough data to detect seasonal cycles** — it requires at least 2× the seasonal period (14+ days for weekly patterns) in the training window. On large datasets or many series it can add 1–2 minutes to training time.
 - **Per-series model selection** — when multiple metrics are forecast, each series independently picks its best model. A single global winner is shown only when all series agree.
         """
     )
